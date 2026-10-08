@@ -183,6 +183,13 @@ struct MixerView: View {
                 }.font(MixerStyle.body)
             }
             Divider()
+            Slider(value: Binding(get: {
+                selectedOutput?.volume ?? 0
+            }, set: { volume in
+                if let source = selectedOutput { audio.setVolume(source, volume) }
+            }), in: 0...1)
+            .disabled(selectedOutput?.channels.isEmpty ?? true)
+            .accessibilityLabel("Output volume")
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack {
@@ -252,6 +259,10 @@ struct MixerView: View {
             Button("OK") { audio.error = nil }
             Button("Retry app mixing") { audio.error = nil; audio.disableMixing(); audio.enableMixing() }
         } message: { Text(audio.error ?? "") }
+    }
+
+    private var selectedOutput: AudioSource? {
+        audio.sources.first { !$0.input && $0.isDefault }
     }
 
     private var selectedProfileName: String? {
