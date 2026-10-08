@@ -189,7 +189,7 @@ struct MixerView: View {
                 if let source = selectedOutput { audio.setVolume(source, volume) }
             }), in: 0...1)
             .disabled(selectedOutput?.channels.isEmpty ?? true)
-            .opacity(selectedOutput?.channels.isEmpty ?? true ? 0.3 : 1)
+            .opacity(audio.soundMuted ? 0.4 : 1)
             .accessibilityLabel("Output volume")
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -313,7 +313,7 @@ struct MixerView: View {
                 Image(systemName: app.muted ? "speaker.slash" : "speaker.wave.1").frame(width: 14)
             }.buttonStyle(.plain).disabled(!routed).foregroundStyle(app.muted ? accent : .secondary)
                 .help(app.muted ? "Unmute \(app.name)" : "Mute \(app.name)")
-        }.opacity(routed ? 1 : 0.3)
+        }.opacity(routed ? 1 : 0.55)
     }
     private func deviceSymbol(_ source: AudioSource) -> String {
         let name = source.name.lowercased()
@@ -366,6 +366,8 @@ struct MixerView: View {
                 }
                 .padding(.horizontal, 8).padding(.vertical, 7)
                 .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(live.isDefault ? accent.opacity(0.12) : Color.primary.opacity(0.04)))
+                .opacity((input ? audio.micMuted : audio.soundMuted) ? 0.4 : 1)
+                .animation(.easeOut(duration: 0.15), value: input ? audio.micMuted : audio.soundMuted)
             }
         }
     }
