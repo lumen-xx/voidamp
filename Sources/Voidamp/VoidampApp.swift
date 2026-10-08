@@ -189,7 +189,7 @@ struct MixerView: View {
                 if let source = selectedOutput { audio.setVolume(source, volume) }
             }), in: 0...1)
             .disabled(selectedOutput?.channels.isEmpty ?? true)
-            .opacity(audio.soundMuted ? 0.4 : 1)
+            .saturation(audio.soundMuted ? 0 : 1).opacity(audio.soundMuted ? 0.5 : 1)
             .accessibilityLabel("Output volume")
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -338,7 +338,7 @@ struct MixerView: View {
                             Text(audio.displayName(source)).font(live.isDefault ? MixerStyle.section : MixerStyle.body).lineLimit(1)
                             Spacer(minLength: 0)
                             if live.isDefault { Image(systemName: "checkmark").font(MixerStyle.section).foregroundStyle(accent) }
-                        }.contentShape(Rectangle())
+                        }.opacity((input ? audio.micMuted : audio.soundMuted) ? 0.4 : 1).contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .help("Use \(audio.displayName(source)) · \(source.name)")
@@ -359,6 +359,8 @@ struct MixerView: View {
                         HStack(spacing: 8) {
                             Slider(value: Binding(get: { audio.displayVolume(source) }, set: { audio.setVolume(source, $0) }), in: 0...1)
                                 .controlSize(.small)
+                                .saturation((input ? audio.micMuted : audio.soundMuted) ? 0 : 1)
+                                .opacity((input ? audio.micMuted : audio.soundMuted) ? 0.5 : 1)
                                 .accessibilityLabel("\(source.name) \(input ? "input gain" : "output volume")")
                             Text("\(Int((audio.displayVolume(source) * 100).rounded()))%").font(MixerStyle.value).monospacedDigit().lineLimit(1).fixedSize().frame(width: 38, alignment: .trailing)
                         }.padding(.leading, 26)
@@ -366,8 +368,6 @@ struct MixerView: View {
                 }
                 .padding(.horizontal, 8).padding(.vertical, 7)
                 .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(live.isDefault ? accent.opacity(0.12) : Color.primary.opacity(0.04)))
-                .opacity((input ? audio.micMuted : audio.soundMuted) ? 0.4 : 1)
-                .animation(.easeOut(duration: 0.15), value: input ? audio.micMuted : audio.soundMuted)
             }
         }
     }
