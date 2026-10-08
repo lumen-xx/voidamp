@@ -1,3 +1,15 @@
+## Install
+
+1. Download the [latest release](https://github.com/lumen-xx/voidmap-releases/releases/latest), unzip it, and move **Voidamp.app** to **Applications**.
+2. Open it. If blocked, go to **System Settings → Privacy & Security → Open Anyway**, or run:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/Voidamp.app"
+open "/Applications/Voidamp.app"
+```
+
+3. Allow system audio access when prompted, then click the sliders icon in the menu bar.
+
 <img src="docs/images/logo.png" alt="Voidamp logo" width="96" />
 
 # Voidamp
@@ -22,13 +34,6 @@ Voidamp stays in your menu bar with no Dock icon. Audio stays on your Mac; it is
 ![Voidamp compact toolbar](docs/images/toolbar.png)
 
 *Development screenshots; the current release uses native checkboxes, a Mixing switch, and a combined Profiles/More island.*
-
-## Install
-
-1. Download the ZIP from the [latest release](https://github.com/lumen-xx/voidmap-releases/releases/latest) and unzip it.
-2. Drag **Voidamp.app** into **Applications**, then open it.
-3. Allow system audio access when prompted. You can also enable it in **System Settings → Privacy & Security → Screen & System Audio Recording**.
-4. Click the sliders icon in the menu bar. Play audio in an app to see its volume control.
 
 ## If macOS blocks the app
 
