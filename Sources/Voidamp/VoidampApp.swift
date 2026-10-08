@@ -8,9 +8,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let popover = NSPopover()
     private var audio: AudioController?
     private var iconSubscription: AnyCancellable?
-    private var pendingPanelOpen = false
-    private var menuTrackingDepth = 0
-    private var focusObservers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
@@ -28,36 +25,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let audio = AudioController()
         self.audio = audio
-        let host = FirstClickHostingController(rootView: MixerView(audio: audio, updater: updater))
+        let host = NSHostingController(rootView: MixerView(audio: audio, updater: updater))
         host.sizingOptions = [.preferredContentSize]
         popover.contentViewController = host
         popover.behavior = .transient
         popover.animates = false
-        focusObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                if self?.pendingPanelOpen == true { self?.showPanel() }
-            }
-        })
-        focusObservers.append(NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.menuTrackingDepth += 1 }
-        })
-        focusObservers.append(NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                self.menuTrackingDepth = max(0, self.menuTrackingDepth - 1)
-                DispatchQueue.main.async {
-                    if self.menuTrackingDepth == 0, !NSApplication.shared.isActive { self.popover.performClose(nil) }
-                }
-            }
-        })
-        // Native popovers handle outside clicks. Menu windows can temporarily take key
-        // focus, so resign-key notifications must not dismiss the owning panel.
-        focusObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, self.menuTrackingDepth == 0 else { return }
-                self.popover.performClose(nil)
-            }
-        })
+        // Let NSPopover manage focus and outside-click dismissal. Native menus
+        // temporarily own focus and must not trigger custom dismissal handlers.
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = NSImage(systemSymbolName: audio.statusSymbol, accessibilityDescription: "Voidamp")
         item.button?.image?.isTemplate = true
@@ -76,25 +50,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     @objc private func togglePanel() {
-        if popover.isShown {
-            pendingPanelOpen = false
-            popover.performClose(nil)
-        } else if NSApplication.shared.isActive { showPanel() }
-        else {
-            pendingPanelOpen = true
-            NSApplication.shared.activate()
-        }
+        if popover.isShown { popover.performClose(nil) }
+        else { showPanel() }
     }
     private func showPanel() {
-        pendingPanelOpen = false
-        guard menuTrackingDepth == 0, let button = statusItem?.button else { return }
+        guard let button = statusItem?.button else { return }
+        // Accessory apps do not reliably emit didBecomeActive after activate().
+        // Present directly from the status-item action; native transient behavior
+        // dismisses outside clicks without stealing focus back from open menus.
+        NSApplication.shared.activate()
+        if let view = popover.contentViewController?.view {
+            view.layoutSubtreeIfNeeded()
+            let size = view.fittingSize
+            guard size.width > 0, size.height > 0 else { return }
+            popover.contentSize = size
+        }
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         audio?.shutDown()
-        focusObservers.forEach(NotificationCenter.default.removeObserver)
     }
 }
 
@@ -465,23 +441,5 @@ private struct MuteControlSurface: ViewModifier {
                 content.background(Color.red, in: Capsule())
             }
         } else { content }
-    }
-}
-
-// Deliver the activating mouse-down to controls instead of consuming it for focus.
-private final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-}
-
-private final class FirstClickHostingController<Content: View>: NSHostingController<Content> {
-    private let initialContent: Content
-    override init(rootView: Content) {
-        initialContent = rootView
-        super.init(rootView: rootView)
-    }
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("Use init(rootView:)") }
-    override func loadView() {
-        view = FirstClickHostingView(rootView: initialContent)
     }
 }
