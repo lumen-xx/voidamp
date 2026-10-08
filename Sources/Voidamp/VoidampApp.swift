@@ -24,11 +24,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let audio = AudioController()
         self.audio = audio
-        let host = NSHostingController(rootView: MixerView(audio: audio, updater: updater))
+        let host = FirstClickHostingController(rootView: MixerView(audio: audio, updater: updater))
         host.sizingOptions = [.preferredContentSize]
         popover.contentViewController = host
         popover.behavior = .transient
-        popover.animates = true
+        popover.animates = false
+        focusObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.focusPanel() }
+        })
         focusObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.popover.performClose(nil) }
         })
@@ -59,9 +62,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         else if let button = statusItem?.button {
             NSApplication.shared.activate()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKey()
+            focusPanel()
+            // Activation completes asynchronously when another app owns focus.
+            DispatchQueue.main.async { self.focusPanel() }
         }
     }
+    private func focusPanel() {
+        guard popover.isShown, NSApplication.shared.isActive else { return }
+        popover.contentViewController?.view.window?.makeKey()
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         audio?.shutDown()
         focusObservers.forEach(NotificationCenter.default.removeObserver)
@@ -425,5 +435,23 @@ private struct MuteControlSurface: ViewModifier {
                 content.background(Color.red, in: Capsule())
             }
         } else { content }
+    }
+}
+
+// Deliver the activating mouse-down to controls instead of consuming it for focus.
+private final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+private final class FirstClickHostingController<Content: View>: NSHostingController<Content> {
+    private let initialContent: Content
+    override init(rootView: Content) {
+        initialContent = rootView
+        super.init(rootView: rootView)
+    }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("Use init(rootView:)") }
+    override func loadView() {
+        view = FirstClickHostingView(rootView: initialContent)
     }
 }
