@@ -1,66 +1,32 @@
-## Install
-
-1. Download the [latest release](https://github.com/lumen-xx/voidmap-releases/releases/latest), unzip it, and move **Voidamp.app** to **Applications**.
-2. Open it. If blocked, go to **System Settings → Privacy & Security → Open Anyway**, or run:
-
-```sh
-xattr -dr com.apple.quarantine "/Applications/Voidamp.app"
-open "/Applications/Voidamp.app"
-```
-
-3. Allow system audio access when prompted, then click the sound icon in the menu bar.
-
 <img src="docs/images/logo.png" alt="Voidamp logo" width="96" />
 
 # Voidamp
 
-A small macOS menu bar mixer for your apps, speakers, and microphones. Adjust Safari, Brave, Spotify, and other playing apps individually without opening their settings.
+A small macOS menu bar mixer for your apps, speakers and microphones.
 
-**Requires an Apple silicon Mac and macOS 14.2 or newer.** Liquid Glass is available on macOS 26 and newer.
+![Voidamp](docs/images/toolbar.png)
 
-## What it does
+## Install
 
-- Control each playing app’s volume from **0–200%**, with a snap at **100%**.
-- Mute sound or microphones from the top bar.
-- Choose an output or input device and adjust its volume or microphone gain.
-- Right-click a device to give it a custom name in Voidamp.
-- Save your device selections, levels, and mute states as **profiles**.
-- Check for signed updates from **More → Check for Updates…**.
-- Enable **More → Start at Login** to launch Voidamp automatically. If macOS asks for approval, use **Approve Start at Login…**.
+macOS 14.2+ · Apple silicon
 
-Voidamp stays in your menu bar with no Dock icon. Its icon follows the active output and mute state using native speaker and headphone symbols. Audio stays on your Mac; it isn’t recorded to disk or uploaded. Boosting above 100% can distort loud audio. Some devices have fixed hardware volume, and some protected audio cannot be mixed.
-
-## Screenshots
-
-![Voidamp compact toolbar](docs/images/toolbar.png)
-
-*Development screenshots; the current release uses native checkboxes, a Mixing switch, and a combined Profiles/More island.*
-
-## If macOS blocks the app
-
-Voidamp is not Apple notarized, so the first installation may be blocked. Use either method below for the Voidamp app downloaded from this repository.
-
-### Open through System Settings
-
-1. Try opening **Voidamp.app** once and dismiss the warning.
-2. Open **System Settings → Privacy & Security** and scroll to **Security**.
-3. Click **Open Anyway** beside the Voidamp warning, then confirm **Open**. Enter your Mac password if asked.
-
-This approves Voidamp without changing your Mac’s general security settings. [Apple’s instructions](https://support.apple.com/en-us/102445).
-
-### Remove quarantine through Terminal
-
-After moving the app into Applications, open **Terminal** and run:
+1. [Download Voidamp](https://github.com/lumen-xx/voidmap-releases/releases/latest), unzip and move **Voidamp.app** to **Applications**.
+2. Open it. If macOS blocks it, go to **System Settings → Privacy & Security → Open Anyway**, or run:
 
 ```sh
-xattr -dr com.apple.quarantine "/Applications/Voidamp.app"
-open "/Applications/Voidamp.app"
+xattr -dr com.apple.quarantine /Applications/Voidamp.app
 ```
 
-The first command removes the download quarantine flag from **Voidamp.app only**; the second opens it. If you installed it somewhere else, replace the path with its actual location.
+3. Allow system audio access when prompted, then click the sound icon in the menu bar.
 
-## Updates
+Voidamp is not notarized yet. Only run this for Voidamp downloaded here.
 
-Use **More → Check for Updates…**. Voidamp also checks automatically and lets you choose whether to install. Sparkle verifies signed update archives and the update feed. Older builds without Sparkle need this updater-enabled version installed once.
+## Use
 
-This repository contains public releases and the update feed. The source repository is private.
+- Set each app's volume from 0–200%.
+- Mute sound or microphones, and pick output and input devices.
+- Save device and level setups as profiles.
+
+Updates: **More → Check for Updates…**
+
+The source repository is private.
