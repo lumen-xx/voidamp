@@ -3,80 +3,48 @@ import AppKit
 import Combine
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var statusItem: NSStatusItem?
-    private let popover = NSPopover()
-    private var audio: AudioController?
-    private var iconSubscription: AnyCancellable?
+final class VoidampRuntime: ObservableObject {
+    static let shared = VoidampRuntime()
+    let audio = AudioController()
+    let updater = AppUpdater()
+}
 
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
-        let updater = AppUpdater()
         if CommandLine.arguments.contains("--updater-check") {
+            let updater = VoidampRuntime.shared.updater
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                if updater.canCheckForUpdates {
-                    print("PASS: Sparkle initializes from the app bundle and can check for updates")
-                    exit(0)
+                guard updater.canCheckForUpdates else {
+                    print("FAIL: Sparkle did not become ready")
+                    exit(1)
                 }
-                print("FAIL: Sparkle did not become ready to check for updates")
-                exit(1)
+                print("PASS: Sparkle initializes and can check for updates")
+                exit(0)
             }
-            return
         }
-        let audio = AudioController()
-        self.audio = audio
-        let host = NSHostingController(rootView: MixerView(audio: audio, updater: updater))
-        host.sizingOptions = [.preferredContentSize]
-        popover.contentViewController = host
-        popover.behavior = .transient
-        popover.animates = false
-        // Let NSPopover manage focus and outside-click dismissal. Native menus
-        // temporarily own focus and must not trigger custom dismissal handlers.
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = NSImage(systemSymbolName: audio.statusSymbol, accessibilityDescription: "Voidamp")
-        item.button?.image?.isTemplate = true
-        item.button?.toolTip = "Voidamp"
-        item.button?.target = self
-        item.button?.action = #selector(togglePanel)
-        statusItem = item
-        iconSubscription = audio.$sources.combineLatest(audio.$soundMuted).receive(on: RunLoop.main).sink { [weak self, weak audio] _, _ in
-            guard let audio, let button = self?.statusItem?.button else { return }
-            button.image = NSImage(systemSymbolName: audio.statusSymbol, accessibilityDescription: "Voidamp")
-            button.image?.isTemplate = true
-            button.toolTip = "Voidamp · \(audio.statusDescription)"
-        }
-        if CommandLine.arguments.contains("--preview") {
-            DispatchQueue.main.async { self.togglePanel() }
-        }
-    }
-    @objc private func togglePanel() {
-        if popover.isShown { popover.performClose(nil) }
-        else { showPanel() }
-    }
-    private func showPanel() {
-        guard let button = statusItem?.button else { return }
-        // Accessory apps do not reliably emit didBecomeActive after activate().
-        // Present directly from the status-item action; native transient behavior
-        // dismisses outside clicks without stealing focus back from open menus.
-        NSApplication.shared.activate()
-        if let view = popover.contentViewController?.view {
-            view.layoutSubtreeIfNeeded()
-            let size = view.fittingSize
-            guard size.width > 0, size.height > 0 else { return }
-            popover.contentSize = size
-        }
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        audio?.shutDown()
+        VoidampRuntime.shared.audio.shutDown()
+    }
+}
+
+private struct SoundStatusLabel: View {
+    @ObservedObject var audio: AudioController
+
+    var body: some View {
+        Image(systemName: audio.statusSymbol)
+            .accessibilityLabel("Voidamp")
+            .help("Voidamp · \(audio.statusDescription)")
     }
 }
 
 @main
 struct VoidampApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @StateObject private var runtime = VoidampRuntime.shared
 
     init() {
         if CommandLine.arguments.contains("--route-check") {
@@ -120,7 +88,12 @@ struct VoidampApp: App {
     }
 
     var body: some Scene {
-        Settings { EmptyView() }
+        MenuBarExtra {
+            MixerView(audio: runtime.audio, updater: runtime.updater)
+        } label: {
+            SoundStatusLabel(audio: runtime.audio)
+        }
+        .menuBarExtraStyle(.window)
     }
 }
 
