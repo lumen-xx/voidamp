@@ -184,11 +184,12 @@ struct MixerView: View {
             }
             Divider()
             Slider(value: Binding(get: {
-                selectedOutput?.volume ?? 0
+                selectedOutput.map { audio.displayVolume($0) } ?? 0
             }, set: { volume in
                 if let source = selectedOutput { audio.setVolume(source, volume) }
             }), in: 0...1)
             .disabled(selectedOutput?.channels.isEmpty ?? true)
+            .opacity(selectedOutput?.channels.isEmpty ?? true ? 0.3 : 1)
             .accessibilityLabel("Output volume")
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -312,7 +313,7 @@ struct MixerView: View {
                 Image(systemName: app.muted ? "speaker.slash" : "speaker.wave.1").frame(width: 14)
             }.buttonStyle(.plain).disabled(!routed).foregroundStyle(app.muted ? accent : .secondary)
                 .help(app.muted ? "Unmute \(app.name)" : "Mute \(app.name)")
-        }.opacity(routed ? 1 : 0.55)
+        }.opacity(routed ? 1 : 0.3)
     }
     private func deviceSymbol(_ source: AudioSource) -> String {
         let name = source.name.lowercased()
@@ -356,11 +357,10 @@ struct MixerView: View {
                         Text("Volume is controlled by this device").font(MixerStyle.caption).foregroundStyle(.tertiary).padding(.leading, 26)
                     } else {
                         HStack(spacing: 8) {
-                            Slider(value: Binding(get: { audio.sources.first(where: { $0.id == source.id })?.volume ?? source.volume }, set: { audio.setVolume(source, $0) }), in: 0...1)
+                            Slider(value: Binding(get: { audio.displayVolume(source) }, set: { audio.setVolume(source, $0) }), in: 0...1)
                                 .controlSize(.small)
-                                .disabled(input ? audio.micMuted : audio.soundMuted)
                                 .accessibilityLabel("\(source.name) \(input ? "input gain" : "output volume")")
-                            Text("\(Int((live.volume * 100).rounded()))%").font(MixerStyle.value).monospacedDigit().lineLimit(1).fixedSize().frame(width: 38, alignment: .trailing)
+                            Text("\(Int((audio.displayVolume(source) * 100).rounded()))%").font(MixerStyle.value).monospacedDigit().lineLimit(1).fixedSize().frame(width: 38, alignment: .trailing)
                         }.padding(.leading, 26)
                     }
                 }

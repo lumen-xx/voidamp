@@ -125,8 +125,14 @@ final class AudioController: ObservableObject {
         return count > 0 ? (1...UInt32(count)).filter(writable) : []
     }
 
+    /// The level to show for a device: while a software mute holds the device at 0, this is the level it returns to.
+    func displayVolume(_ source: AudioSource) -> Double {
+        let live = sources.first(where: { $0.id == source.id }) ?? source
+        if (live.input ? micMuted : soundMuted), nativeMuteStates[live.id] == nil, let held = mutedDevices[live.id] { return held }
+        return live.volume
+    }
     func setVolume(_ source: AudioSource, _ volume: Double) {
-        if (source.input ? micMuted : soundMuted) && nativeMuteStates[source.id] == nil { mutedDevices[source.id] = min(1, max(0, volume)); return }
+        if (source.input ? micMuted : soundMuted) && nativeMuteStates[source.id] == nil { mutedDevices[source.id] = min(1, max(0, volume)); objectWillChange.send(); return }
         writeVolume(source, volume)
     }
 
