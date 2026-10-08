@@ -355,3 +355,32 @@ extension AudioController {
         preferences.set(deviceNames, forKey: "deviceNames")
     }
 }
+
+
+extension AudioController {
+    private var activeOutput: AudioSource? { sources.first { !$0.input && $0.isDefault } }
+    var outputIsMuted: Bool {
+        guard let source = activeOutput else { return soundMuted }
+        return soundMuted || (!source.channels.isEmpty && source.volume == 0)
+            || scalar(source.device, address(kAudioDevicePropertyMute), initial: UInt32(0)) == 1
+    }
+    var statusSymbol: String {
+        guard let source = activeOutput else { return "speaker.slash.fill" }
+        if outputIsMuted { return "speaker.slash.fill" }
+        let name = source.name.lowercased()
+        let port = scalar(source.device, address(kAudioDevicePropertyDataSource), initial: UInt32(0))
+        let headphoneTerminal = HAL.ids(source.device, kAudioDevicePropertyStreams, scope: kAudioDevicePropertyScopeOutput).contains { stream in
+            HAL.read(stream, kAudioStreamPropertyTerminalType, initial: UInt32(0)) == kAudioStreamTerminalTypeHeadphones
+        }
+        if headphoneTerminal || port == 0x6864706e || ["headphone", "headset", "airpod", "earbud", "nothing ear", "evolve2", "arctis"].contains(where: name.contains) {
+            return "headphones"
+        }
+        if source.volume < 0.34 { return "speaker.wave.1.fill" }
+        if source.volume < 0.67 { return "speaker.wave.2.fill" }
+        return "speaker.wave.3.fill"
+    }
+    var statusDescription: String {
+        guard let source = activeOutput else { return "No output device" }
+        return "\(displayName(source)) · \(outputIsMuted ? "Muted" : "\(Int((source.volume * 100).rounded()))%")"
+    }
+}

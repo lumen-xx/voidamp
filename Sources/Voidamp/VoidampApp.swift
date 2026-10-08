@@ -1,11 +1,15 @@
 import SwiftUI
 import AppKit
+import Combine
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
     private var audio: AudioController?
+    private var iconSubscription: AnyCancellable?
+    private var pendingPanelOpen = false
+    private var menuTrackingDepth = 0
     private var focusObservers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -30,45 +34,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.behavior = .transient
         popover.animates = false
         focusObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.focusPanel() }
-        })
-        focusObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.popover.performClose(nil) }
-        })
-        focusObservers.append(NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: nil, queue: .main) { [weak self] notification in
             MainActor.assumeIsolated {
-                guard let self, let window = notification.object as? NSWindow,
-                      window === self.popover.contentViewController?.view.window else { return }
+                if self?.pendingPanelOpen == true { self?.showPanel() }
+            }
+        })
+        focusObservers.append(NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.menuTrackingDepth += 1 }
+        })
+        focusObservers.append(NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.menuTrackingDepth = max(0, self.menuTrackingDepth - 1)
                 DispatchQueue.main.async {
-                    if self.popover.isShown, !window.isKeyWindow, window.attachedSheet == nil {
-                        self.popover.performClose(nil)
-                    }
+                    if self.menuTrackingDepth == 0, !NSApplication.shared.isActive { self.popover.performClose(nil) }
                 }
             }
         })
+        // Native popovers handle outside clicks. Menu windows can temporarily take key
+        // focus, so resign-key notifications must not dismiss the owning panel.
+        focusObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.menuTrackingDepth == 0 else { return }
+                self.popover.performClose(nil)
+            }
+        })
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "Voidamp")
+        item.button?.image = NSImage(systemSymbolName: audio.statusSymbol, accessibilityDescription: "Voidamp")
         item.button?.image?.isTemplate = true
         item.button?.toolTip = "Voidamp"
         item.button?.target = self
         item.button?.action = #selector(togglePanel)
         statusItem = item
+        iconSubscription = audio.$sources.combineLatest(audio.$soundMuted).receive(on: RunLoop.main).sink { [weak self, weak audio] _, _ in
+            guard let audio, let button = self?.statusItem?.button else { return }
+            button.image = NSImage(systemSymbolName: audio.statusSymbol, accessibilityDescription: "Voidamp")
+            button.image?.isTemplate = true
+            button.toolTip = "Voidamp · \(audio.statusDescription)"
+        }
         if CommandLine.arguments.contains("--preview") {
             DispatchQueue.main.async { self.togglePanel() }
         }
     }
     @objc private func togglePanel() {
-        if popover.isShown { popover.performClose(nil) }
-        else if let button = statusItem?.button {
+        if popover.isShown {
+            pendingPanelOpen = false
+            popover.performClose(nil)
+        } else if NSApplication.shared.isActive { showPanel() }
+        else {
+            pendingPanelOpen = true
             NSApplication.shared.activate()
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            focusPanel()
-            // Activation completes asynchronously when another app owns focus.
-            DispatchQueue.main.async { self.focusPanel() }
         }
     }
-    private func focusPanel() {
-        guard popover.isShown, NSApplication.shared.isActive else { return }
+    private func showPanel() {
+        pendingPanelOpen = false
+        guard menuTrackingDepth == 0, let button = statusItem?.button else { return }
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
     }
 
@@ -131,6 +151,7 @@ struct VoidampApp: App {
 struct MixerView: View {
     @ObservedObject var audio: AudioController
     @ObservedObject var updater: AppUpdater
+    @StateObject private var loginItem = LoginItem()
     @State private var devicesExpanded = false
     @State private var renamingDevice: AudioSource?
     @State private var deviceName = ""
@@ -183,6 +204,11 @@ struct MixerView: View {
                         Button("Check for Updates…") { updater.checkForUpdates() }
                             .disabled(!updater.canCheckForUpdates)
                         Button("Refresh sources") { audio.refresh() }
+                        Divider()
+                        Toggle("Start at Login", isOn: Binding(get: { loginItem.enabled }, set: { loginItem.setEnabled($0) }))
+                        if loginItem.needsApproval {
+                            Button("Approve Start at Login…") { loginItem.openSettings() }
+                        }
                         Divider()
                         Button("Quit Voidamp") { audio.shutDown(); NSApplication.shared.terminate(nil) }
                     } label: {
@@ -269,6 +295,10 @@ struct MixerView: View {
                 renamingDevice = nil
             }
         } message: { Text("This name is only used in Voidamp. Leave empty to restore the original name.") }
+        .onReceive(loginItem.$error.compactMap { $0 }) { message in
+            audio.error = message
+            loginItem.error = nil
+        }
         .alert("Audio control", isPresented: Binding(get: { audio.error != nil }, set: { if !$0 { audio.error = nil } })) {
             Button("OK") { audio.error = nil }
             Button("Retry app mixing") { audio.error = nil; audio.disableMixing(); audio.enableMixing() }

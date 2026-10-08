@@ -8,7 +8,7 @@ xattr -dr com.apple.quarantine "/Applications/Voidamp.app"
 open "/Applications/Voidamp.app"
 ```
 
-3. Allow system audio access when prompted, then click the sliders icon in the menu bar.
+3. Allow system audio access when prompted, then click the sound icon in the menu bar.
 
 <img src="docs/images/logo.png" alt="Voidamp logo" width="96" />
 
@@ -26,8 +26,9 @@ A small macOS menu bar mixer for your apps, speakers, and microphones. Adjust Sa
 - Right-click a device to give it a custom name in Voidamp.
 - Save your device selections, levels, and mute states as **profiles**.
 - Check for signed updates from **More → Check for Updates…**.
+- Enable **More → Start at Login** to launch Voidamp automatically. If macOS asks for approval, use **Approve Start at Login…**.
 
-Voidamp stays in your menu bar with no Dock icon. Audio stays on your Mac; it isn’t recorded to disk or uploaded. Boosting above 100% can distort loud audio. Some devices have fixed hardware volume, and some protected audio cannot be mixed.
+Voidamp stays in your menu bar with no Dock icon. Its icon follows the active output and mute state using native speaker and headphone symbols. Audio stays on your Mac; it isn’t recorded to disk or uploaded. Boosting above 100% can distort loud audio. Some devices have fixed hardware volume, and some protected audio cannot be mixed.
 
 ## Screenshots
 
