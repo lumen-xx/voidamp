@@ -1,13 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VERSION="${VOIDAMP_VERSION:-1.1.0}"
-BUILD="${VOIDAMP_BUILD:-2}"
+VERSION="${VOIDAMP_VERSION:-1.1.1}"
+BUILD="${VOIDAMP_BUILD:-3}"
 APP="$(pwd)/dist/Voidamp.app"
 swift build -c release
 BIN_PATH="$(swift build -c release --show-bin-path)"
 FRAMEWORK=".build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks"
+if [ -d "$APP/Contents/Resources" ]; then
+    rm -rf "$APP/Contents/Resources"
+fi
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
+ditto Sources/Voidamp/Resources "$APP/Contents/Resources"
 cp "$BIN_PATH/Voidamp" "$APP/Contents/MacOS/Voidamp"
 if [ -d "$APP/Contents/Frameworks/Sparkle.framework" ]; then
     rm -rf "$APP/Contents/Frameworks/Sparkle.framework"
@@ -22,6 +26,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>Voidamp</string>
 <key>CFBundleDisplayName</key><string>Voidamp</string>
 <key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>LSMinimumSystemVersion</key><string>14.2</string>
 <key>LSUIElement</key><true/>
 <key>NSAudioCaptureUsageDescription</key><string>Voidamp mixes application audio so you can control and boost each app’s volume. Audio stays on your Mac.</string>

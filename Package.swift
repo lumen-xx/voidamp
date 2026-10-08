@@ -9,6 +9,7 @@ let package = Package(
     targets: [.executableTarget(
         name: "Voidamp",
         dependencies: [.product(name: "Sparkle", package: "Sparkle")],
+        resources: [.process("Resources")],
         linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])]
     )],
     swiftLanguageModes: [.v5]
