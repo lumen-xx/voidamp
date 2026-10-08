@@ -1,10 +1,18 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-swift build -c release
+VERSION="${VOIDAMP_VERSION:-1.1.0}"
+BUILD="${VOIDAMP_BUILD:-2}"
 APP="$(pwd)/dist/Voidamp.app"
-mkdir -p "$APP/Contents/MacOS"
-cp .build/release/Voidamp "$APP/Contents/MacOS/Voidamp"
+swift build -c release
+BIN_PATH="$(swift build -c release --show-bin-path)"
+FRAMEWORK=".build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks"
+cp "$BIN_PATH/Voidamp" "$APP/Contents/MacOS/Voidamp"
+if [ -d "$APP/Contents/Frameworks/Sparkle.framework" ]; then
+    rm -rf "$APP/Contents/Frameworks/Sparkle.framework"
+fi
+ditto "$FRAMEWORK" "$APP/Contents/Frameworks/Sparkle.framework"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -14,13 +22,24 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>Voidamp</string>
 <key>CFBundleDisplayName</key><string>Voidamp</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.0.0</string>
-<key>CFBundleVersion</key><string>1</string>
 <key>LSMinimumSystemVersion</key><string>14.2</string>
 <key>LSUIElement</key><true/>
 <key>NSAudioCaptureUsageDescription</key><string>Voidamp mixes application audio so you can control and boost each app’s volume. Audio stays on your Mac.</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>SUEnableAutomaticChecks</key><true/>
+<key>SUAutomaticallyUpdate</key><false/>
+<key>SUEnableInstallerLauncherService</key><true/>
+<key>SUVerifyUpdateBeforeExtraction</key><true/>
+<key>SURequireSignedFeed</key><true/>
 </dict></plist>
 PLIST
+PUBLIC_KEY="$(cat updates/public-key.txt)"
+UPDATE_REPOSITORY="$(cat updates/repository.txt)"
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $PUBLIC_KEY" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :SUFeedURL string https://github.com/$UPDATE_REPOSITORY/releases/latest/download/appcast.xml" "$APP/Contents/Info.plist"
+# Preserve Sparkle's upstream signatures, including its nested helpers.
 codesign --force --sign - "$APP"
-echo "Built $APP"
+codesign --verify --deep --strict "$APP"
+echo "Built $APP ($VERSION, build $BUILD)"

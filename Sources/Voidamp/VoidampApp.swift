@@ -10,9 +10,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
+        let updater = AppUpdater()
+        if CommandLine.arguments.contains("--updater-check") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                if updater.canCheckForUpdates {
+                    print("PASS: Sparkle initializes from the app bundle and can check for updates")
+                    exit(0)
+                }
+                print("FAIL: Sparkle did not become ready to check for updates")
+                exit(1)
+            }
+            return
+        }
         let audio = AudioController()
         self.audio = audio
-        let host = NSHostingController(rootView: MixerView(audio: audio))
+        let host = NSHostingController(rootView: MixerView(audio: audio, updater: updater))
         host.sizingOptions = [.preferredContentSize]
         popover.contentViewController = host
         popover.behavior = .transient
@@ -108,6 +120,7 @@ struct VoidampApp: App {
 
 struct MixerView: View {
     @ObservedObject var audio: AudioController
+    @ObservedObject var updater: AppUpdater
     @State private var devicesExpanded = false
     @State private var renamingDevice: AudioSource?
     @State private var deviceName = ""
@@ -157,6 +170,8 @@ struct MixerView: View {
                     .help(selectedProfileName.map { "Selected profile: \($0)" } ?? "Profiles")
                     .accessibilityLabel(selectedProfileName.map { "Profiles, \($0) selected" } ?? "Profiles")
                     Menu {
+                        Button("Check for Updates…") { updater.checkForUpdates() }
+                            .disabled(!updater.canCheckForUpdates)
                         Button("Refresh sources") { audio.refresh() }
                         Divider()
                         Button("Quit Voidamp") { audio.shutDown(); NSApplication.shared.terminate(nil) }

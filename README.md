@@ -38,6 +38,6 @@ swift build
 
 The read-only audio self-check also uses an isolated preferences domain to verify profile persistence/deletion, stable device ordering, gain bounds, and the 100% snap behavior. App playback routing requires separate live verification with system audio permission.
 
-Open `Package.swift` in Xcode to edit. No dependencies.
+Open `Package.swift` in Xcode to edit. Uses Sparkle for signed app updates. See [updates/README.md](updates/README.md) for release preparation, signing, and publishing.
 
 Apple reference: [Capturing system audio with Core Audio taps](https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps).
