@@ -397,7 +397,8 @@ private struct MixerContentHeight: PreferenceKey {
 }
 
 // SwiftUI's indicator preference can be overridden by macOS's Always scroll-bar setting.
-// Disable the actual AppKit scrollers while retaining wheel and trackpad scrolling.
+// Overlay scrollers reserve no gutter, even when macOS prefers legacy scrollers.
+// Disable the indicators while retaining wheel and trackpad scrolling.
 private struct HideNativeScrollbars: NSViewRepresentable {
     func makeNSView(context: Context) -> ScrollbarHider { ScrollbarHider() }
     func updateNSView(_ view: ScrollbarHider, context: Context) {
@@ -415,6 +416,9 @@ private final class ScrollbarHider: NSView {
         var ancestor = superview
         while let view = ancestor {
             if let scroll = view as? NSScrollView {
+                if scroll.scrollerStyle != .overlay { scroll.scrollerStyle = .overlay }
+                scroll.automaticallyAdjustsContentInsets = false
+                if !NSEdgeInsetsEqual(scroll.contentInsets, NSEdgeInsetsZero) { scroll.contentInsets = NSEdgeInsetsZero }
                 if scroll.hasVerticalScroller { scroll.hasVerticalScroller = false }
                 if scroll.hasHorizontalScroller { scroll.hasHorizontalScroller = false }
                 scroll.autohidesScrollers = true
