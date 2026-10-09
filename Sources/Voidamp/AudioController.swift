@@ -11,6 +11,7 @@ struct AudioSource: Identifiable {
     let channels: [UInt32]
     var volume: Double
     var isDefault: Bool
+    var isBuiltIn: Bool = false
     var id: String { "\(uid)-\(input)" }
 }
 
@@ -99,10 +100,15 @@ final class AudioController: ObservableObject {
                 let volume = values.isEmpty ? 1 : Double(values.reduce(0, +) / Float(values.count))
                 let uid = HAL.string(device, kAudioDevicePropertyDeviceUID) ?? String(device)
                 if uid.hasPrefix("app.voidamp.route.") { continue }
-                result.append(AudioSource(device: device, uid: uid, name: name as String, input: input, channels: channels, volume: volume, isDefault: device == defaultID))
+                result.append(AudioSource(device: device, uid: uid, name: name as String, input: input, channels: channels, volume: volume, isDefault: device == defaultID, isBuiltIn: scalar(device, global(kAudioDevicePropertyTransportType), initial: UInt32(0)) == kAudioDeviceTransportTypeBuiltIn))
             }
         }
-        sources = result.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        sources = result.sorted {
+            if $0.isBuiltIn != $1.isBuiltIn { return $0.isBuiltIn }
+            let order = $0.name.localizedStandardCompare($1.name)
+            if order != .orderedSame { return order == .orderedAscending }
+            return $0.id < $1.id
+        }
         enforceMute()
         refreshApps()
     }
