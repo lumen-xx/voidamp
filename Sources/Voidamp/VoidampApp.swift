@@ -11,6 +11,10 @@ final class VoidampRuntime: ObservableObject {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var statusItem: NSStatusItem?
+    private let popover = NSPopover()
+    private var iconSubscription: AnyCancellable?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
         if CommandLine.arguments.contains("--updater-check") {
@@ -23,7 +27,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 print("PASS: Sparkle initializes and can check for updates")
                 exit(0)
             }
+            return
         }
+        configureStatusItem()
+    }
+
+    private func configureStatusItem() {
+        let runtime = VoidampRuntime.shared
+        let host = NSHostingController(rootView: MixerView(audio: runtime.audio, updater: runtime.updater))
+        host.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = host
+        popover.behavior = .transient
+        popover.animates = false
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.autosaveName = "VoidampSound"
+        item.isVisible = true
+        item.button?.target = self
+        item.button?.action = #selector(togglePanel)
+        statusItem = item
+        iconSubscription = runtime.audio.$sources.combineLatest(runtime.audio.$soundMuted)
+            .receive(on: RunLoop.main).sink { [weak self] _, _ in
+                let audio = VoidampRuntime.shared.audio
+                self?.statusItem?.button?.image = NSImage(systemSymbolName: audio.statusSymbol, accessibilityDescription: "Voidamp")
+                self?.statusItem?.button?.image?.isTemplate = true
+                self?.statusItem?.button?.toolTip = "Voidamp · \(audio.statusDescription)"
+            }
+    }
+
+    @objc private func togglePanel() {
+        if popover.isShown { popover.performClose(nil); return }
+        guard let button = statusItem?.button, let host = popover.contentViewController else { return }
+        host.view.layoutSubtreeIfNeeded()
+        popover.contentSize = host.view.fittingSize
+        // AppKit positions the arrow at the anchor and keeps the panel on screen.
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        NSApplication.shared.activate()
+        host.view.window?.makeKey()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -31,20 +70,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-private struct SoundStatusLabel: View {
-    @ObservedObject var audio: AudioController
-
-    var body: some View {
-        Image(systemName: audio.statusSymbol)
-            .accessibilityLabel("Voidamp")
-            .help("Voidamp · \(audio.statusDescription)")
-    }
-}
-
 @main
 struct VoidampApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var runtime = VoidampRuntime.shared
 
     init() {
         if CommandLine.arguments.contains("--route-check") {
@@ -88,12 +116,7 @@ struct VoidampApp: App {
     }
 
     var body: some Scene {
-        MenuBarExtra {
-            MixerView(audio: runtime.audio, updater: runtime.updater)
-        } label: {
-            SoundStatusLabel(audio: runtime.audio)
-        }
-        .menuBarExtraStyle(.window)
+        Settings { EmptyView() }
     }
 }
 
