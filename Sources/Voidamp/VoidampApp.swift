@@ -354,40 +354,44 @@ struct MixerView: View {
             Text(title).font(MixerStyle.section).foregroundStyle(.tertiary)
             ForEach(audio.sources.filter { $0.input == input }) { source in
                 let live = audio.sources.first(where: { $0.id == source.id }) ?? source
-                VStack(alignment: .leading, spacing: 6) {
-                    Button { audio.select(source) } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: deviceSymbol(source)).font(MixerStyle.body).frame(width: 18)
-                                .foregroundStyle(live.isDefault ? accent : .secondary)
-                            Text(audio.displayName(source)).font(live.isDefault ? MixerStyle.section : MixerStyle.body).lineLimit(1)
-                            Spacer(minLength: 0)
-                            if live.isDefault { Image(systemName: "checkmark").font(MixerStyle.section).foregroundStyle(accent) }
-                        }.opacity((input ? audio.micMuted : audio.soundMuted) ? 0.4 : 1).contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("Use \(audio.displayName(source)) · \(source.name)")
-                    .accessibilityLabel(audio.displayName(source))
-                    .accessibilityAddTraits(live.isDefault ? .isSelected : [])
-                    .contextMenu {
-                        Button("Rename…") {
-                            deviceName = audio.displayName(source)
-                            renamingDevice = source
+                // The icon is centred beside the name and its volume; the selected device shows through its
+                // accent background, icon and name weight rather than a checkmark.
+                HStack(alignment: .center, spacing: 8) {
+                    Image(systemName: deviceSymbol(source)).font(MixerStyle.body).frame(width: 18)
+                        .foregroundStyle(live.isDefault ? accent : .secondary)
+                        .opacity((input ? audio.micMuted : audio.soundMuted) ? 0.4 : 1)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Button { audio.select(source) } label: {
+                            HStack(spacing: 8) {
+                                Text(audio.displayName(source)).font(live.isDefault ? MixerStyle.section : MixerStyle.body).lineLimit(1)
+                                Spacer(minLength: 0)
+                            }.opacity((input ? audio.micMuted : audio.soundMuted) ? 0.4 : 1).contentShape(Rectangle())
                         }
-                        if audio.displayName(source) != source.name {
-                            Button("Restore original name") { audio.renameDevice(source, to: "") }
+                        .buttonStyle(.plain)
+                        .help("Use \(audio.displayName(source)) · \(source.name)")
+                        .accessibilityLabel(audio.displayName(source))
+                        .accessibilityAddTraits(live.isDefault ? .isSelected : [])
+                        .contextMenu {
+                            Button("Rename…") {
+                                deviceName = audio.displayName(source)
+                                renamingDevice = source
+                            }
+                            if audio.displayName(source) != source.name {
+                                Button("Restore original name") { audio.renameDevice(source, to: "") }
+                            }
                         }
-                    }
-                    if source.channels.isEmpty {
-                        Text("Volume is controlled by this device").font(MixerStyle.caption).foregroundStyle(.tertiary).padding(.leading, 26)
-                    } else {
-                        HStack(spacing: 8) {
-                            Slider(value: Binding(get: { audio.displayVolume(source) }, set: { audio.setVolume(source, $0) }), in: 0...1)
-                                .controlSize(.small)
-                                .saturation((input ? audio.micMuted : audio.soundMuted) ? 0 : 1)
-                                .opacity((input ? audio.micMuted : audio.soundMuted) ? 0.5 : 1)
-                                .accessibilityLabel("\(source.name) \(input ? "input gain" : "output volume")")
-                            Text("\(Int((audio.displayVolume(source) * 100).rounded()))%").font(MixerStyle.value).monospacedDigit().lineLimit(1).fixedSize().frame(width: 38, alignment: .trailing)
-                        }.padding(.leading, 26)
+                        if source.channels.isEmpty {
+                            Text("Volume is controlled by this device").font(MixerStyle.caption).foregroundStyle(.tertiary)
+                        } else {
+                            HStack(spacing: 8) {
+                                Slider(value: Binding(get: { audio.displayVolume(source) }, set: { audio.setVolume(source, $0) }), in: 0...1)
+                                    .controlSize(.small)
+                                    .saturation((input ? audio.micMuted : audio.soundMuted) ? 0 : 1)
+                                    .opacity((input ? audio.micMuted : audio.soundMuted) ? 0.5 : 1)
+                                    .accessibilityLabel("\(source.name) \(input ? "input gain" : "output volume")")
+                                Text("\(Int((audio.displayVolume(source) * 100).rounded()))%").font(MixerStyle.value).monospacedDigit().lineLimit(1).fixedSize().frame(width: 38, alignment: .trailing)
+                            }
+                        }
                     }
                 }
                 .padding(.horizontal, 8).padding(.vertical, 7)
