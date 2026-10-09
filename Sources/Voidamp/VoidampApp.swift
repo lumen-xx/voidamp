@@ -256,7 +256,8 @@ struct MixerView: View {
                     Color.clear.preference(key: MixerContentHeight.self, value: geometry.size.height)
                 })
             }
-            .scrollIndicators(.hidden)
+            // .hidden still lays the content out 17 pt narrower for a scroll bar it never shows; .never gives the full width.
+            .scrollIndicators(.never)
             .scrollDisabled(measuredContentHeight <= 380)
             .frame(height: min(380, measuredContentHeight))
             .onPreferenceChange(MixerContentHeight.self) { measuredContentHeight = ceil($0) }
@@ -419,9 +420,8 @@ private struct MixerContentHeight: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
-// SwiftUI's indicator preference can be overridden by macOS's Always scroll-bar setting.
-// Overlay scrollers reserve no gutter, even when macOS prefers legacy scrollers.
-// Disable the indicators while retaining wheel and trackpad scrolling.
+// Belt and braces next to .scrollIndicators(.never): keeps the AppKit scroller in overlay style with no scrollers,
+// so macOS's legacy or Always scroll-bar setting cannot bring a gutter back, while wheel and trackpad scrolling stay.
 private struct HideNativeScrollbars: NSViewRepresentable {
     func makeNSView(context: Context) -> ScrollbarHider { ScrollbarHider() }
     func updateNSView(_ view: ScrollbarHider, context: Context) {

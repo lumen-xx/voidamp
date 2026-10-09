@@ -1,6 +1,6 @@
 ## Install
 
-1. Download the [latest release](https://github.com/lumen-xx/voidmap-releases/releases/latest), unzip it, and move **Voidamp.app** to **Applications**.
+1. Download the [latest release](https://github.com/lumen-xx/voidamp-releases/releases/latest), unzip it, and move **Voidamp.app** to **Applications**.
 2. Open it. If blocked, go to **System Settings → Privacy & Security → Open Anyway**, or run:
 
 ```sh
