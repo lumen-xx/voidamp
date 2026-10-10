@@ -14,6 +14,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
     private var iconSubscription: AnyCancellable?
+    private var focusSubscription: AnyCancellable?
+    private var openingPanel = false
+    private var outsideClickMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
@@ -34,11 +37,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func configureStatusItem() {
         let runtime = VoidampRuntime.shared
-        let host = NSHostingController(rootView: MixerView(audio: runtime.audio, updater: runtime.updater))
+        let host = FirstClickHostingController(rootView: MixerView(audio: runtime.audio, updater: runtime.updater))
         host.sizingOptions = [.preferredContentSize]
         popover.contentViewController = host
         popover.behavior = .transient
         popover.animates = false
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.openingPanel = false
+                if self?.popover.isShown == true { self?.popover.performClose(nil) }
+            }
+        }
+        focusSubscription = NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)
+            .receive(on: RunLoop.main).sink { [weak self] _ in
+                // Menu windows can take key focus without deactivating the app.
+                // Only dismiss when another application actually becomes active.
+                guard !NSApplication.shared.isActive else { return }
+                self?.openingPanel = false
+                self?.popover.performClose(nil)
+            }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.autosaveName = "VoidampSound"
         item.isVisible = true
@@ -55,18 +72,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func togglePanel() {
-        if popover.isShown { popover.performClose(nil); return }
-        guard let button = statusItem?.button, let host = popover.contentViewController else { return }
-        host.view.layoutSubtreeIfNeeded()
-        popover.contentSize = host.view.fittingSize
-        // AppKit positions the arrow at the anchor and keeps the panel on screen.
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        if popover.isShown || openingPanel {
+            openingPanel = false
+            popover.performClose(nil)
+            return
+        }
+        openingPanel = true
         NSApplication.shared.activate()
-        host.view.window?.makeKey()
+        // Present on the next run-loop turn so activation does not interrupt a
+        // newly opened menu. Never wait for an activation notification to show.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.openingPanel else { return }
+            self.openingPanel = false
+            guard let button = self.statusItem?.button, let host = self.popover.contentViewController else { return }
+            host.view.layoutSubtreeIfNeeded()
+            self.popover.contentSize = host.view.fittingSize
+            self.popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            host.view.window?.makeKey()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let outsideClickMonitor { NSEvent.removeMonitor(outsideClickMonitor) }
         VoidampRuntime.shared.audio.shutDown()
+    }
+}
+
+private final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+private final class FirstClickHostingController<Content: View>: NSHostingController<Content> {
+    override func loadView() {
+        view = FirstClickHostingView(rootView: rootView)
     }
 }
 
