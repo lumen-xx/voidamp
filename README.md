@@ -20,7 +20,8 @@ A small macOS menu bar mixer for your apps, speakers, and microphones. Adjust Sa
 
 ## What it does
 
-- Control each playing app’s volume from **0–200%**, with a snap at **100%**.
+- Control each playing app’s volume from **0–200%**, with a snap at **100%**. Click an app’s percentage to return it to 100%.
+- Show or hide one **System Sounds** row for alerts and notifications with **More → Show System Sounds in Mixing**.
 - Mute sound or microphones from the top bar.
 - Choose an output or input device and adjust its volume or microphone gain.
 - Right-click a device to give it a custom name in Voidamp.
@@ -76,7 +77,7 @@ Drag `dist/Voidamp.app` into Applications if desired. Voidamp runs in the menu b
 
 ## App mixing
 
-Mixing is on by default at launch. The native **Mixing** switch turns it on or off. Play audio in an app to see its controls. macOS requires permission in **System Settings → Privacy & Security → Screen & System Audio Recording**. No audio is recorded to disk or transmitted.
+Mixing is on by default at launch. The native **Mixing** switch turns it on or off. Play audio in an app to see its controls. An app only runs through Voidamp once its level or mute differs from normal; untouched apps play directly. Levels are remembered per app. macOS requires permission in **System Settings → Privacy & Security → Screen & System Audio Recording**. If nothing can be captured, Voidamp leaves every app playing normally and shows a notice with **Open Settings** and **Retry** instead of an alert. Ad-hoc builds lose this permission after each update; turn Voidamp off and on again there. No audio is recorded to disk or transmitted.
 
 Each playing app has a gain slider from 0% to 200% and its own mute button. While dragging, values within four percentage points of 100% snap to normal volume. Keyboard adjustment stays continuous. Boosting amplifies the app’s audio samples; loud material can distort at boosted levels. Samples are limited to the output’s range.
 

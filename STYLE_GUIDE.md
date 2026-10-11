@@ -18,3 +18,7 @@ The panel is 340 pt wide with 14 pt outer padding, 12 pt section spacing, and 8 
 Devices is a full-width plain button without a visible button surface. Its chevron indicates expansion. Audio content determines panel height; content above 380 pt scrolls with no visible scrollbar. The panel closes when the app or panel loses focus.
 
 Each device is a rounded row with a device icon and name; tapping it selects the device, and the active one gets an accent tint and a checkmark. The volume slider sits beneath the name.
+
+The output level above Apps follows Control Centre’s Sound slider: a 24 pt capsule track, a white fill with the speaker symbol at its start, and a round white knob. Clicking the track jumps to that level.
+
+Each app row ends with its percentage, which resets the app to 100% when clicked. An app Voidamp couldn’t mix shows an orange warning in place of the percentage; clicking it retries. When no app audio can be captured at all, an orange notice under Apps offers Open Settings and Retry instead of an alert.

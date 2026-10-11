@@ -3,7 +3,7 @@ import CoreAudio
 import Combine
 import AppKit
 
-struct AudioSource: Identifiable {
+struct AudioSource: Identifiable, Equatable {
     let device: AudioDeviceID
     let uid: String
     let name: String
@@ -26,13 +26,25 @@ final class AudioController: ObservableObject {
     @Published var profiles: [MixerProfile] = []
     @Published var selectedProfile: UUID?
     @Published private var deviceNames: [String: String] = [:]
+    /// Apps Voidamp couldn't mix; their original audio keeps playing.
+    @Published private(set) var routeFailures: [String: RouteFailure] = [:]
+    /// Set when no route has ever delivered audio this session, which points at the
+    /// Screen & System Audio Recording permission. No new routes start until Retry.
+    @Published private(set) var captureBlocked = false
+    /// One "System Sounds" row that is always listed, or never listed and never mixed.
+    @Published var showSystemSounds: Bool {
+        didSet { preferences.set(showSystemSounds, forKey: "showSystemSounds"); refreshApps() }
+    }
     private var routes: [String: AppRoute] = [:]
     private var appSettings: [String: AppSetting] = [:]
     private var nativeMuteStates: [String: UInt32] = [:]
     private var mutedDevices: [String: Double] = [:]
-    private var failedRoutes: Set<String> = []
+    private var failedProcesses: [String: Set<AudioObjectID>] = [:]
+    private var captureConfirmed = false
     private var routeOutputUID: String?
-    private var routeProcesses: [String: [AudioObjectID]] = [:]
+    private var lastPlayed: [String: Date] = [:]
+    private var recentApps: [String: AppSource] = [:]
+    private var watcher: ProcessWatcher?
     private let preferences: UserDefaults
     private var terminationObserver: NSObjectProtocol?
     private var timer: Timer?
@@ -42,8 +54,11 @@ final class AudioController: ObservableObject {
         self.preferences = preferences
         self.deviceNames = preferences.dictionary(forKey: "deviceNames") as? [String: String] ?? [:]
         self.mixingEnabled = autoStartMixing
+        self.showSystemSounds = preferences.object(forKey: "showSystemSounds") as? Bool ?? true
         if let data = preferences.data(forKey: "profiles"), let stored = try? JSONDecoder().decode([MixerProfile].self, from: data) { profiles = stored }
+        if let data = preferences.data(forKey: "appSettings"), let stored = try? JSONDecoder().decode([String: AppSetting].self, from: data) { appSettings = stored }
         refresh()
+        if autoStartMixing { watcher = ProcessWatcher { [weak self] in self?.refreshApps() } }
         terminationObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.shutDown() }
         }
@@ -103,12 +118,14 @@ final class AudioController: ObservableObject {
                 result.append(AudioSource(device: device, uid: uid, name: name as String, input: input, channels: channels, volume: volume, isDefault: device == defaultID, isBuiltIn: scalar(device, global(kAudioDevicePropertyTransportType), initial: UInt32(0)) == kAudioDeviceTransportTypeBuiltIn))
             }
         }
-        sources = result.sorted {
+        let sorted = result.sorted {
             if $0.isBuiltIn != $1.isBuiltIn { return $0.isBuiltIn }
             let order = $0.name.localizedStandardCompare($1.name)
             if order != .orderedSame { return order == .orderedAscending }
             return $0.id < $1.id
         }
+        // Publishing identical values every second re-rendered the panel and menu bar icon for nothing.
+        if sorted != sources { sources = sorted }
         enforceMute()
         refreshApps()
     }
@@ -171,9 +188,10 @@ final class AudioController: ObservableObject {
     }
 }
 
-struct AppSetting: Codable {
+struct AppSetting: Codable, Equatable {
     var gain: Double
     var muted: Bool
+    static let unchanged = AppSetting(gain: 1, muted: false)
 }
 struct MixerProfile: Codable, Identifiable {
     var id = UUID()
@@ -203,7 +221,7 @@ extension AudioController {
                 writeVolume(source, previous)
             }
         }
-        if !input { for app in apps { routes[app.id]?.setGain(soundMuted || app.muted ? 0 : app.gain) } }
+        if !input { applyRouteGains() }
     }
 
     private func enforceMute() {
@@ -231,87 +249,217 @@ extension AudioController {
         return true
     }
 
+    // MARK: App mixing
+    //
+    // An app only gets a route (a process tap that silences it, replayed at its own gain) once its level or
+    // mute differs from normal. Untouched apps play exactly as macOS plays them, so a capture problem can
+    // never silence them. A route that never delivers audio is removed within two seconds and the app is
+    // marked instead of interrupting with an alert.
+
+    /// How long an app stays listed, and keeps its route, after it stops playing. Pausing and resuming
+    /// then neither flickers the row nor briefly plays at the original level.
+    private static let lingerInterval: TimeInterval = 20
+
     func enableMixing() {
         mixingEnabled = true
-        failedRoutes.removeAll()
+        clearFailures()
         refreshApps()
     }
     func disableMixing() {
         routes.removeAll() // Destroying taps restores the original application audio.
         mixingEnabled = false
-        failedRoutes.removeAll()
+        clearFailures()
     }
-    private func refreshApps() {
-        let ids = HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList)
-        var groups: [String: (String, NSImage?, [AudioObjectID])] = [:]
-        let running = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
-        for id in ids {
+    /// Tries every app again, for example after allowing audio access in System Settings.
+    func retryMixing() {
+        clearFailures()
+        refreshApps()
+    }
+    private func clearFailures() {
+        failedProcesses.removeAll()
+        if !routeFailures.isEmpty { routeFailures.removeAll() }
+        if captureBlocked { captureBlocked = false }
+    }
+
+    func refreshApps() {
+        let now = Date()
+        let liveObjects = HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList)
+        let running = NSWorkspace.shared.runningApplications
+        var groups: [String: (name: String, icon: NSImage?, processes: [AudioObjectID])] = [:]
+        for id in liveObjects {
             guard let pid = HAL.read(id, kAudioProcessPropertyPID, initial: pid_t(0)), pid != getpid(),
-                  HAL.read(id, kAudioProcessPropertyIsRunningOutput, initial: UInt32(0)) == 1 else { continue }
-            let processApp = NSRunningApplication(processIdentifier: pid)
-            let bundle = HAL.string(id, kAudioProcessPropertyBundleID) ?? processApp?.bundleIdentifier ?? "process.\(pid)"
-            // Browser audio often belongs to a helper process. Match the owning app bundle.
-            let owner = running.filter { app in
-                guard let appID = app.bundleIdentifier else { return false }
-                return bundle == appID || bundle.hasPrefix(appID + ".") || (processApp?.bundleURL?.path.hasPrefix((app.bundleURL?.path ?? "\0") + "/") ?? false)
-            }.max { ($0.bundleIdentifier?.count ?? 0) < ($1.bundleIdentifier?.count ?? 0) }
-            let key = owner?.bundleIdentifier ?? bundle
-            if groups[key] == nil { groups[key] = (owner?.localizedName ?? processApp?.localizedName ?? bundle, owner?.icon ?? processApp?.icon, []) }
-            groups[key]?.2.append(id)
+                  HAL.read(id, kAudioProcessPropertyIsRunningOutput, initial: UInt32(0)) == 1,
+                  HAL.string(id, kAudioProcessPropertyBundleID) != "app.voidamp.mac" else { continue }
+            switch AudioOwner(pid: pid, processObject: id, running: running) {
+            case .app(let key, let name, let icon):
+                groups[key, default: (name, icon, [])].processes.append(id)
+            case .system:
+                guard showSystemSounds else { continue }
+                groups[AppSource.systemSoundsID, default: ("System Sounds", nil, [])].processes.append(id)
+            }
         }
-        apps = groups.map { key, value in
-            let setting = appSettings[key] ?? AppSetting(gain: 1, muted: false)
-            return AppSource(id: key, name: value.0, icon: value.1, processes: value.2.sorted(), gain: setting.gain, muted: setting.muted)
-        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        guard mixingEnabled, let output = sources.first(where: { !$0.input && $0.isDefault }) else { routes.removeAll(); return }
+        let live = Set(liveObjects)
+        var listed: [AppSource] = groups.map { key, group in
+            let setting = appSettings[key] ?? .unchanged
+            let source = AppSource(id: key, name: group.name, icon: group.icon, processes: group.processes.sorted(), gain: setting.gain, muted: setting.muted)
+            lastPlayed[key] = now
+            recentApps[key] = source
+            return source
+        }
+        for (key, recent) in recentApps where groups[key] == nil {
+            let quiet = now.timeIntervalSince(lastPlayed[key] ?? .distantPast)
+            // Keep a paused app briefly, but drop it at once when it quits or when system sounds are hidden.
+            let stillRunning = recent.processes.contains(where: live.contains)
+            if quiet < Self.lingerInterval, stillRunning, !recent.isSystem || showSystemSounds {
+                listed.append(idle(recent))
+            } else {
+                recentApps.removeValue(forKey: key)
+                lastPlayed.removeValue(forKey: key)
+            }
+        }
+        if showSystemSounds, !listed.contains(where: \.isSystem) {
+            listed.append(idle(AppSource(id: AppSource.systemSoundsID, name: "System Sounds", icon: nil, processes: [], gain: 1, muted: false)))
+        }
+        listed.sort {
+            if $0.isSystem != $1.isSystem { return $1.isSystem }
+            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+        if listed != apps { apps = listed }
+        updateRoutes(live: live, now: now)
+    }
+
+    private func idle(_ source: AppSource) -> AppSource {
+        let setting = appSettings[source.id] ?? .unchanged
+        return AppSource(id: source.id, name: source.name, icon: source.icon, processes: [], gain: setting.gain, muted: setting.muted)
+    }
+
+    private func needsRoute(_ id: String) -> Bool {
+        let setting = appSettings[id] ?? .unchanged
+        return setting.muted || abs(setting.gain - 1) > 0.001
+    }
+    private func effectiveGain(_ id: String) -> Double {
+        let setting = appSettings[id] ?? .unchanged
+        return soundMuted || setting.muted ? 0 : setting.gain
+    }
+    private func applyRouteGains() {
+        for (id, route) in routes { route.setGain(effectiveGain(id)) }
+    }
+
+    private func updateRoutes(live: Set<AudioObjectID>, now: Date) {
+        guard mixingEnabled, let output = sources.first(where: { !$0.input && $0.isDefault }) else {
+            routes.removeAll()
+            return
+        }
         if routeOutputUID != output.uid {
-            failedRoutes.removeAll()
+            // A new output can behave differently, so give every app another chance.
             routeOutputUID = output.uid
+            failedProcesses.removeAll()
+            if !routeFailures.isEmpty { routeFailures.removeAll() }
         }
-        let active = Set(apps.map(\.id))
-        for key in Array(routes.keys) where !active.contains(key) { routes.removeValue(forKey: key) }
+        let listed = Dictionary(uniqueKeysWithValues: apps.map { ($0.id, $0) })
+        for (id, route) in routes where listed[id] == nil || route.outputUID != output.uid {
+            routes.removeValue(forKey: id)
+        }
         for app in apps {
-            if routeProcesses[app.id] != app.processes {
-                failedRoutes.remove(app.id)
-                routeProcesses[app.id] = app.processes
-            }
-            if let route = routes[app.id], route.processes == app.processes, route.outputUID == output.uid {
-                if Date().timeIntervalSince(route.createdAt) > 10, route.callbackCount == 0 {
+            var keep: Set<AudioObjectID> = []
+            if let route = routes[app.id] {
+                switch route.health(now: now) {
+                case .neverStarted:
                     routes.removeValue(forKey: app.id)
-                    failedRoutes.insert(app.id)
-                    error = "No audio arrived from \(app.name). Original playback has been restored. Allow Voidamp in System Settings → Privacy & Security → Screen & System Audio Recording, then retry mixing."
+                    fail(app, captureConfirmed ? .message("No audio arrived from \(app.name).") : .noAudio)
+                    continue
+                case .stalled:
+                    // Callbacks stopped after working, e.g. after sleep. Rebuild so the app isn't left silent.
+                    routes.removeValue(forKey: app.id)
+                case .healthy:
+                    captureConfirmed = true
+                    let current = route.processes.filter(live.contains)
+                    if current.count != route.processes.count {
+                        routes.removeValue(forKey: app.id) // A helper quit; its tap can't be reused.
+                        keep = Set(current)
+                    } else if Set(app.processes).isSubset(of: route.processes) {
+                        continue // Paused apps keep their route until they leave the list.
+                    } else {
+                        routes.removeValue(forKey: app.id)
+                        keep = Set(current)
+                    }
+                case .starting:
+                    continue
                 }
-                continue
             }
-            routes.removeValue(forKey: app.id)
-            guard !failedRoutes.contains(app.id) else { continue }
-            do {
-                routes[app.id] = try AppRoute(processes: app.processes, output: output.device, gain: soundMuted || app.muted ? 0 : app.gain)
-            } catch {
-                failedRoutes.insert(app.id)
-                self.error = error.localizedDescription
-            }
+            // An app back at 100% and unmuted plays directly again; nothing to rebuild.
+            guard app.isPlaying, needsRoute(app.id) else { continue }
+            startRoute(for: app, including: keep, output: output)
         }
     }
+
+    private func startRoute(for app: AppSource, including extra: Set<AudioObjectID> = [], output: AudioSource) {
+        let processes = Set(app.processes).union(extra)
+        guard !captureBlocked, !processes.isEmpty else { return }
+        if let failed = failedProcesses[app.id] {
+            guard failed != processes else { return }
+            // Different processes play now (a helper restarted), so try once more.
+            failedProcesses.removeValue(forKey: app.id)
+            routeFailures.removeValue(forKey: app.id)
+        }
+        do {
+            routes[app.id] = try AppRoute(processes: processes.sorted(), output: output.device, gain: effectiveGain(app.id))
+        } catch {
+            fail(app, .message(error.localizedDescription))
+        }
+    }
+
+    private func fail(_ app: AppSource, _ failure: RouteFailure) {
+        failedProcesses[app.id] = Set(app.processes)
+        routeFailures[app.id] = failure
+        if failure == .noAudio {
+            // Nothing has ever been captured: every other route would fail the same way and briefly
+            // silence its app. Hold off until Retry.
+            captureBlocked = true
+            routes.removeAll()
+        }
+    }
+
     func routingDiagnostics() -> [String] {
         apps.map { app in
             if let route = routes[app.id] { return "\(app.name): \(route.callbackCount) audio callbacks" }
-            return "\(app.name): not routed"
+            if let failure = routeFailures[app.id] { return "\(app.name): not routed (\(failure))" }
+            return "\(app.name): plays directly"
         }
     }
-    func appIsRouted(_ app: AppSource) -> Bool { routes[app.id] != nil }
+    /// Whether the app's controls work: mixing is on and Voidamp hasn't failed to capture it.
+    func canAdjust(_ app: AppSource) -> Bool {
+        mixingEnabled && !captureBlocked && routeFailures[app.id] == nil
+    }
     func setAppGain(_ app: AppSource, _ value: Double, snapping: Bool = false) {
-        guard routes[app.id] != nil else { return }
+        guard canAdjust(app) else { return }
         let gain = MixerGain.adjusted(value, snapping: snapping)
-        appSettings[app.id] = AppSetting(gain: gain, muted: app.muted)
-        if let index = apps.firstIndex(where: { $0.id == app.id }) { apps[index].gain = gain }
-        routes[app.id]?.setGain(soundMuted || app.muted ? 0 : gain)
+        updateSetting(app) { $0.gain = gain }
     }
     func toggleAppMute(_ app: AppSource) {
-        guard routes[app.id] != nil else { return }
-        appSettings[app.id] = AppSetting(gain: app.gain, muted: !app.muted)
-        if let index = apps.firstIndex(where: { $0.id == app.id }) { apps[index].muted.toggle() }
-        routes[app.id]?.setGain(soundMuted || !app.muted ? 0 : app.gain)
+        guard canAdjust(app) else { return }
+        updateSetting(app) { $0.muted.toggle() }
+    }
+    private func updateSetting(_ app: AppSource, _ change: (inout AppSetting) -> Void) {
+        var setting = appSettings[app.id] ?? .unchanged
+        change(&setting)
+        appSettings[app.id] = setting
+        persistAppSettings()
+        if let index = apps.firstIndex(where: { $0.id == app.id }) {
+            apps[index].gain = setting.gain
+            apps[index].muted = setting.muted
+        }
+        if let route = routes[app.id] {
+            route.setGain(effectiveGain(app.id))
+        } else if let live = apps.first(where: { $0.id == app.id }), live.isPlaying, needsRoute(app.id),
+                  let output = sources.first(where: { !$0.input && $0.isDefault }) {
+            startRoute(for: live, output: output)
+        }
+    }
+    private func persistAppSettings() {
+        // Normal levels need no entry; dropping them keeps the stored list to apps the user changed.
+        let changed = appSettings.filter { $0.value != .unchanged }
+        if let data = try? JSONEncoder().encode(changed) { preferences.set(data, forKey: "appSettings") }
     }
     func saveProfile(name: String) {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -320,7 +468,7 @@ extension AudioController {
             devices: Dictionary(uniqueKeysWithValues: sources.filter { !$0.channels.isEmpty }.map { ($0.id, mutedDevices[$0.id] ?? $0.volume) }),
             outputUID: sources.first { !$0.input && $0.isDefault }?.uid,
             inputUID: sources.first { $0.input && $0.isDefault }?.uid,
-            apps: appSettings, soundMuted: soundMuted, micMuted: micMuted, mixingEnabled: mixingEnabled)
+            apps: appSettings.filter { $0.value != .unchanged }, soundMuted: soundMuted, micMuted: micMuted, mixingEnabled: mixingEnabled)
         profiles.append(profile)
         selectedProfile = profile.id
         persistProfiles()
@@ -330,13 +478,14 @@ extension AudioController {
         if soundMuted { toggleSoundMute() }
         if micMuted { toggleMicMute() }
         appSettings = profile.apps
+        persistAppSettings()
         for source in sources {
             if let volume = profile.devices[source.id] { writeVolume(source, volume) }
         }
         if let output = sources.first(where: { !$0.input && $0.uid == profile.outputUID }) { select(output) }
         if let input = sources.first(where: { $0.input && $0.uid == profile.inputUID }) { select(input) }
-        if profile.mixingEnabled == true { enableMixing() } else { refreshApps() }
-        for app in apps { routes[app.id]?.setGain(app.muted ? 0 : app.gain) }
+        if profile.mixingEnabled == true, !mixingEnabled { enableMixing() } else { refreshApps() }
+        applyRouteGains()
         if profile.soundMuted { toggleSoundMute() }
         if profile.micMuted { toggleMicMute() }
         selectedProfile = profile.id
@@ -350,10 +499,67 @@ extension AudioController {
         if let data = try? JSONEncoder().encode(profiles) { preferences.set(data, forKey: "profiles") }
     }
     func shutDown() {
+        watcher?.stop()
+        watcher = nil
         disableMixing()
         if soundMuted { toggleSoundMute() }
         if micMuted { toggleMicMute() }
         timer?.invalidate()
+    }
+}
+
+/// Who a playing process belongs to: an app the user knows, or macOS itself (alerts, notifications,
+/// Control Centre), which shares the single System Sounds row.
+private enum AudioOwner {
+    case app(key: String, name: String, icon: NSImage?)
+    case system
+
+    init(pid: pid_t, processObject: AudioObjectID, running: [NSRunningApplication]) {
+        let process = NSRunningApplication(processIdentifier: pid)
+        if let owner = Responsibility.app(for: pid), Self.isUserApp(owner) { self = .init(owner); return }
+        if let process, Self.isUserApp(process) { self = .init(process); return }
+        // Helpers inside an app bundle, or named after its bundle identifier.
+        let bundle = HAL.string(processObject, kAudioProcessPropertyBundleID) ?? process?.bundleIdentifier ?? ""
+        let processPath = process?.bundleURL?.path ?? Self.executablePath(pid) ?? ""
+        let container = running.filter { app in
+            guard let appID = app.bundleIdentifier, Self.isUserApp(app) else { return false }
+            if !bundle.isEmpty, bundle == appID || bundle.hasPrefix(appID + ".") { return true }
+            guard let appPath = app.bundleURL?.path else { return false }
+            return processPath.hasPrefix(appPath + "/")
+        }.max { ($0.bundleIdentifier?.count ?? 0) < ($1.bundleIdentifier?.count ?? 0) }
+        if let container { self = .init(container); return }
+        if let process, let id = process.bundleIdentifier, let path = process.bundleURL?.path, !Self.isSystemPath(path) {
+            self = .app(key: id, name: process.localizedName ?? id, icon: process.icon); return
+        }
+        // Unbundled programs outside the system, such as games running through Wine.
+        if let path = Self.executablePath(pid), !Self.isSystemPath(path) {
+            let name = (path as NSString).lastPathComponent
+            self = .app(key: "process.\(name)", name: name, icon: NSWorkspace.shared.icon(forFile: path)); return
+        }
+        self = .system
+    }
+
+    private init(_ app: NSRunningApplication) {
+        let id = app.bundleIdentifier ?? "process.\(app.processIdentifier)"
+        self = .app(key: id, name: app.localizedName ?? id, icon: app.icon)
+    }
+
+    private static func isUserApp(_ app: NSRunningApplication) -> Bool {
+        guard app.bundleIdentifier != nil, !app.isTerminated else { return false }
+        switch app.activationPolicy {
+        case .regular: return true
+        case .accessory: return !isSystemPath(app.bundleURL?.path ?? "/System/")
+        default: return false
+        }
+    }
+    private static func isSystemPath(_ path: String) -> Bool {
+        if path.hasPrefix("/usr/local/") { return false }
+        return ["/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/"].contains(where: path.hasPrefix)
+    }
+    private static func executablePath(_ pid: pid_t) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        return String(cString: buffer)
     }
 }
 
