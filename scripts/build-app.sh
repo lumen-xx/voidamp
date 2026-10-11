@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VERSION="${VOIDAMP_VERSION:-1.1.18}"
-BUILD="${VOIDAMP_BUILD:-20}"
+VERSION="${VOIDAMP_VERSION:-1.1.19}"
+BUILD="${VOIDAMP_BUILD:-21}"
 APP="$(pwd)/dist/Voidamp.app"
 swift build -c release
 BIN_PATH="$(swift build -c release --show-bin-path)"
@@ -45,6 +45,13 @@ UPDATE_REPOSITORY="$(cat updates/repository.txt)"
 /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $PUBLIC_KEY" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :SUFeedURL string https://github.com/$UPDATE_REPOSITORY/releases/latest/download/appcast.xml" "$APP/Contents/Info.plist"
 # Preserve Sparkle's upstream signatures, including its nested helpers.
-codesign --force --sign - "$APP"
+# A stable identity keeps macOS's Screen & System Audio Recording permission across updates; an ad-hoc
+# signature changes with every build, so macOS stops honouring the permission after each update.
+SIGNING_KEYCHAIN="$(bash scripts/signing-identity.sh)"
+codesign --force --keychain "$SIGNING_KEYCHAIN" --sign "Voidamp Local Signing" "$APP"
+if ! codesign -d --requirements - "$APP" 2>&1 | grep -q "certificate leaf"; then
+    echo "Voidamp was not signed with the stable identity." >&2
+    exit 1
+fi
 codesign --verify --deep --strict "$APP"
 echo "Built $APP ($VERSION, build $BUILD)"

@@ -73,11 +73,11 @@ bash scripts/build-app.sh
 open dist/Voidamp.app
 ```
 
-Drag `dist/Voidamp.app` into Applications if desired. Voidamp runs in the menu bar without a Dock icon or main window. Click the sound icon to open the panel; quit from the ellipsis menu. The build is ad-hoc signed. Sharing with other Macs requires Developer ID signing and notarization.
+Drag `dist/Voidamp.app` into Applications if desired. Voidamp runs in the menu bar without a Dock icon or main window. Click the sound icon to open the panel; quit from the ellipsis menu. Builds are signed with a stable local identity, **Voidamp Local Signing**, which `scripts/signing-identity.sh` creates once in `~/Library/Keychains/voidamp-signing.keychain-db` (password in `~/.config/voidamp/signing-password`). Because the identity never changes, macOS keeps the Screen & System Audio Recording permission across updates. Back up both files: with a new identity, users must allow audio access once more. It isn't an Apple Developer ID, so first installs still need **Open Anyway**.
 
 ## App mixing
 
-Mixing is on by default at launch. The native **Mixing** switch turns it on or off. Play audio in an app to see its controls. An app only runs through Voidamp once its level or mute differs from normal; untouched apps play directly. Levels are remembered per app. macOS requires permission in **System Settings → Privacy & Security → Screen & System Audio Recording**. If nothing can be captured, Voidamp leaves every app playing normally and shows a notice with **Open Settings** and **Retry** instead of an alert. Ad-hoc builds lose this permission after each update; turn Voidamp off and on again there. No audio is recorded to disk or transmitted.
+Mixing is on by default at launch. The native **Mixing** switch turns it on or off. Play audio in an app to see its controls. An app only runs through Voidamp once its level or mute differs from normal; untouched apps play directly. Levels are remembered per app. macOS requires permission in **System Settings → Privacy & Security → Screen & System Audio Recording**. If nothing can be captured, Voidamp leaves every app playing normally and shows a notice with **Open Settings** and **Retry** instead of an alert. Builds up to 1.1.18 were ad-hoc signed and lost this permission after each update; after updating from them, turn Voidamp off and on again there once. No audio is recorded to disk or transmitted.
 
 Each playing app has a gain slider from 0% to 200% and its own mute button. While dragging, values within four percentage points of 100% snap to normal volume. Keyboard adjustment stays continuous. Boosting amplifies the app’s audio samples; loud material can distort at boosted levels. Samples are limited to the output’s range.
 
