@@ -7,6 +7,23 @@ final class VoidampRuntime: ObservableObject {
     static let shared = VoidampRuntime()
     let audio = AudioController()
     let updater = AppUpdater()
+    let loginItem = LoginItem()
+
+    /// The More menu, shared by the panel's ellipsis button and a right-click on the menu bar icon.
+    func moreMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(ClosureMenuItem("Check for Updates…", enabled: updater.canCheckForUpdates) { [updater] in updater.checkForUpdates() })
+        menu.addItem(ClosureMenuItem("Refresh sources") { [audio] in audio.refresh() })
+        menu.addItem(.separator())
+        menu.addItem(ClosureMenuItem("Show System Sounds in Mixing", checked: audio.showSystemSounds) { [audio] in audio.showSystemSounds.toggle() })
+        menu.addItem(ClosureMenuItem("Start at Login", checked: loginItem.enabled) { [loginItem] in loginItem.setEnabled(!loginItem.enabled) })
+        if loginItem.needsApproval {
+            menu.addItem(ClosureMenuItem("Approve Start at Login…") { [loginItem] in loginItem.openSettings() })
+        }
+        menu.addItem(.separator())
+        menu.addItem(ClosureMenuItem("Quit Voidamp") { [audio] in audio.shutDown(); NSApplication.shared.terminate(nil) })
+        return menu
+    }
 }
 
 @MainActor
@@ -38,7 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func configureStatusItem() {
         let runtime = VoidampRuntime.shared
-        let host = FirstClickHostingController(rootView: MixerView(audio: runtime.audio, updater: runtime.updater))
+        let host = FirstClickHostingController(rootView: MixerView(audio: runtime.audio, updater: runtime.updater, loginItem: runtime.loginItem))
         host.sizingOptions = [.preferredContentSize]
         popover.contentViewController = host
         // Closing is ours: a transient popover closes on the status item's mouse-down, and the button's
@@ -70,6 +87,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         item.isVisible = true
         item.button?.target = self
         item.button?.action = #selector(togglePanel)
+        // Right-click opens the More menu. Keep the left button's own timing and add the matching right-button event.
+        if let button = item.button {
+            let left = NSEvent.EventTypeMask(rawValue: UInt64(button.sendAction(on: .leftMouseUp)))
+            button.sendAction(on: left.contains(.leftMouseDown) ? [.leftMouseDown, .rightMouseDown] : [.leftMouseUp, .rightMouseUp])
+        }
         statusItem = item
         iconSubscription = runtime.audio.$sources.combineLatest(runtime.audio.$soundMuted)
             .receive(on: RunLoop.main).sink { [weak self] _, _ in
@@ -110,6 +132,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func togglePanel() {
+        if let event = NSApplication.shared.currentEvent,
+           event.type == .rightMouseDown || event.type == .rightMouseUp || event.modifierFlags.contains(.control) {
+            showMoreMenu()
+            return
+        }
         if popover.isShown { closePanel(); return }
         // The click that just dismissed the panel (outside-click monitor or focus loss) is this same click.
         guard Date().timeIntervalSince(lastClose) > 0.35 else { return }
@@ -122,6 +149,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         host.view.window?.makeKey()
         button.highlight(true)
+    }
+
+    private func showMoreMenu() {
+        closePanel()
+        guard let item = statusItem else { return }
+        // Attaching the menu for one click gives the native status-menu placement and icon highlight.
+        item.menu = VoidampRuntime.shared.moreMenu()
+        item.button?.performClick(nil)
+        item.menu = nil
     }
 
     private func closePanel() {
@@ -216,7 +252,7 @@ struct VoidampApp: App {
 struct MixerView: View {
     @ObservedObject var audio: AudioController
     @ObservedObject var updater: AppUpdater
-    @StateObject private var loginItem = LoginItem()
+    @ObservedObject var loginItem: LoginItem
     @State private var devicesExpanded = false
     @State private var renamingDevice: AudioSource?
     @State private var deviceName = ""
@@ -254,7 +290,7 @@ struct MixerView: View {
                     .frame(minHeight: 30)
                     .contentShape(Rectangle())
                     .accessibilityHidden(true)
-                    .overlay(PopUpMenuButton(label: "More options", makeMenu: moreMenu))
+                    .overlay(PopUpMenuButton(label: "More options", makeMenu: VoidampRuntime.shared.moreMenu))
                     .fixedSize().help("More")
                 }
                 .padding(.horizontal, 10)
@@ -481,21 +517,6 @@ struct MixerView: View {
         return menu
     }
 
-    private func moreMenu() -> NSMenu {
-        let menu = NSMenu()
-        menu.addItem(ClosureMenuItem("Check for Updates…", enabled: updater.canCheckForUpdates) { [updater] in updater.checkForUpdates() })
-        menu.addItem(ClosureMenuItem("Refresh sources") { [audio] in audio.refresh() })
-        menu.addItem(.separator())
-        menu.addItem(ClosureMenuItem("Show System Sounds in Mixing", checked: audio.showSystemSounds) { [audio] in audio.showSystemSounds.toggle() })
-        menu.addItem(ClosureMenuItem("Start at Login", checked: loginItem.enabled) { [loginItem] in loginItem.setEnabled(!loginItem.enabled) })
-        if loginItem.needsApproval {
-            menu.addItem(ClosureMenuItem("Approve Start at Login…") { [loginItem] in loginItem.openSettings() })
-        }
-        menu.addItem(.separator())
-        menu.addItem(ClosureMenuItem("Quit Voidamp") { [audio] in audio.shutDown(); NSApplication.shared.terminate(nil) })
-        return menu
-    }
-
     private func deviceSymbol(_ source: AudioSource) -> String {
         let name = source.name.lowercased()
         if name.contains("airpods") { return source.input ? "mic" : "airpods" }
@@ -683,7 +704,7 @@ private final class PopUpMenuView: NSView {
     }
 }
 
-private final class ClosureMenuItem: NSMenuItem {
+final class ClosureMenuItem: NSMenuItem {
     private let handler: () -> Void
     init(_ title: String, checked: Bool = false, enabled: Bool = true, handler: @escaping () -> Void) {
         self.handler = handler
