@@ -13,6 +13,9 @@ struct AudioSource: Identifiable, Equatable {
     var volume: Double
     var isDefault: Bool
     var isBuiltIn: Bool = false
+    /// The device's own mute switch, read with the device list.
+    var hasMuteSwitch = false
+    var hardwareMuted = false
     var id: String { "\(uid)-\(input)" }
 }
 
@@ -22,8 +25,8 @@ final class AudioController: ObservableObject {
     @Published var error: String?
     @Published var apps: [AppSource] = []
     @Published var mixingEnabled = false
-    @Published var soundMuted = false
-    @Published var micMuted = false
+    @Published var soundMuted = false { didSet { preferences.set(soundMuted, forKey: "soundMuted") } }
+    @Published var micMuted = false { didSet { preferences.set(micMuted, forKey: "micMuted") } }
     @Published var profiles: [MixerProfile] = []
     @Published var selectedProfile: UUID?
     @Published private var deviceNames: [String: String] = [:]
@@ -66,8 +69,31 @@ final class AudioController: ObservableObject {
     }
     private var appSettings: [String: AppSetting] = [:]
     private var nativeMuteStates: [String: UInt32] = [:]
-    private var mutedDevices: [String: Double] = [:]
+    /// Levels to return to after a software mute, by source id. Saved, so a crash while muted can be undone, and
+    /// kept for devices that are unplugged while muted until they come back.
+    private var mutedDevices: [String: Double] = [:] { didSet { preferences.set(mutedDevices, forKey: "mutedDevices") } }
+    /// Devices that refused a volume change; not retried every second, which also showed an alert every second.
+    private var volumeWriteFailures: Set<String> = []
     private var failedProcesses: [String: Set<AudioObjectID>] = [:]
+    /// When a failed app may be tried again, and how often it has failed: a slow device gets another chance.
+    private var retryAt: [String: Date] = [:]
+    private var failureCounts: [String: Int] = [:]
+    /// Apps whose capture produced nothing before any capture worked; two of them point at the permission.
+    private var silentFirstApps: Set<String> = []
+    /// Where a paused app last played when that wasn't the default output, so its route survives the pause.
+    private var lastOwnOutputs: [String: String] = [:]
+    /// The alert device before the Suite moved System Sounds, to put back when they're unwired.
+    private var alertBeforeSuite: String? {
+        get { preferences.string(forKey: "alertBeforeSuite") }
+        set { preferences.set(newValue, forKey: "alertBeforeSuite") }
+    }
+    /// macOS's alert output and which apps record from each input, read once per refresh rather than per render.
+    @Published private(set) var alertDevice: AudioDeviceID = 0
+    @Published private(set) var inputUsers: [AudioDeviceID: [InputUser]] = [:]
+    private var deviceListeners: [(AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
+    /// How often each monitor has stalled since it was wired.
+    private var monitorStalls: [RouteKey: Int] = [:]
+    private var refreshPending = false
     private var captureConfirmed = false
     private var routeOutputUID: String?
     private var lastPlayed: [String: Date] = [:]
@@ -90,7 +116,12 @@ final class AudioController: ObservableObject {
         monitorWiring = preferences.dictionary(forKey: "monitorWiring") as? [String: [String]] ?? [:]
         monitorGains = preferences.dictionary(forKey: "monitorGains") as? [String: Double] ?? [:]
         syncOffsets = preferences.dictionary(forKey: "syncOffsets") as? [String: Double] ?? [:]
+        // Restores the mute a crash left behind, with the levels to return to.
+        soundMuted = preferences.bool(forKey: "soundMuted")
+        micMuted = preferences.bool(forKey: "micMuted")
+        mutedDevices = preferences.dictionary(forKey: "mutedDevices") as? [String: Double] ?? [:]
         refresh()
+        listenForDeviceChanges()
         if autoStartMixing { watcher = ProcessWatcher { [weak self] in self?.refreshApps() } }
         terminationObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.shutDown() }
@@ -133,6 +164,8 @@ final class AudioController: ObservableObject {
         for input in [false, true] {
             let defaultID = scalar(AudioObjectID(kAudioObjectSystemObject), global(input ? kAudioHardwarePropertyDefaultInputDevice : kAudioHardwarePropertyDefaultOutputDevice), initial: AudioDeviceID(0))
             for device in devices {
+                let uid = HAL.string(device, kAudioDevicePropertyDeviceUID) ?? String(device)
+                if uid.hasPrefix("app.voidamp.route.") { continue }
                 var streams = address(kAudioDevicePropertyStreams, input: input)
                 var streamSize: UInt32 = 0
                 guard AudioObjectGetPropertyDataSize(device, &streams, 0, nil, &streamSize) == noErr, streamSize > 0 else { continue }
@@ -146,9 +179,12 @@ final class AudioController: ObservableObject {
                 let channels = volumeChannels(device, input: input)
                 let values = channels.compactMap { scalar(device, address(kAudioDevicePropertyVolumeScalar, input: input, channel: $0), initial: Float32(0)) }
                 let volume = values.isEmpty ? 1 : Double(values.reduce(0, +) / Float(values.count))
-                let uid = HAL.string(device, kAudioDevicePropertyDeviceUID) ?? String(device)
-                if uid.hasPrefix("app.voidamp.route.") { continue }
-                result.append(AudioSource(device: device, uid: uid, name: name as String, input: input, channels: channels, volume: volume, isDefault: device == defaultID, isBuiltIn: scalar(device, global(kAudioDevicePropertyTransportType), initial: UInt32(0)) == kAudioDeviceTransportTypeBuiltIn))
+                var mute = address(kAudioDevicePropertyMute, input: input)
+                var settable: DarwinBoolean = false
+                let hasMuteSwitch = AudioObjectHasProperty(device, &mute) && AudioObjectIsPropertySettable(device, &mute, &settable) == noErr && settable.boolValue
+                result.append(AudioSource(device: device, uid: uid, name: name as String, input: input, channels: channels, volume: volume, isDefault: device == defaultID,
+                                          isBuiltIn: scalar(device, global(kAudioDevicePropertyTransportType), initial: UInt32(0)) == kAudioDeviceTransportTypeBuiltIn,
+                                          hasMuteSwitch: hasMuteSwitch, hardwareMuted: AudioObjectHasProperty(device, &mute) && scalar(device, mute, initial: UInt32(0)) == 1))
             }
         }
         let sorted = result.sorted {
@@ -159,9 +195,60 @@ final class AudioController: ObservableObject {
         }
         // Publishing identical values every second re-rendered the panel and menu bar icon for nothing.
         if sorted != sources { sources = sorted }
+        let alert = HAL.read(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultSystemOutputDevice, initial: AudioDeviceID(0)) ?? 0
+        if alert != alertDevice { alertDevice = alert }
+        let users = readInputUsers()
+        if users != inputUsers { inputUsers = users }
         enforceMute()
+        restorePendingVolumes()
         refreshApps()
         updateMonitors()
+    }
+
+    /// Refreshes as soon as the default devices or the device list change, instead of waiting for the next
+    /// second: wired apps would otherwise play on a new default output for a moment.
+    private func listenForDeviceChanges() {
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        for selector in [kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDefaultInputDevice,
+                         kAudioHardwarePropertyDefaultSystemOutputDevice, kAudioHardwarePropertyDevices] {
+            var address = HAL.address(selector)
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                MainActor.assumeIsolated { self?.scheduleRefresh() }
+            }
+            if AudioObjectAddPropertyListenerBlock(system, &address, .main, block) == noErr { deviceListeners.append((address, block)) }
+        }
+    }
+    private func scheduleRefresh() {
+        guard !refreshPending else { return }
+        refreshPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            MainActor.assumeIsolated {
+                self?.refreshPending = false
+                self?.refresh()
+            }
+        }
+    }
+    private func stopListening() {
+        for (address, block) in deviceListeners {
+            var address = address
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main, block)
+        }
+        deviceListeners.removeAll()
+    }
+
+    /// Which apps record from each input device, by scanning the processes that are recording.
+    private func readInputUsers() -> [AudioDeviceID: [InputUser]] {
+        let running = NSWorkspace.shared.runningApplications
+        var users: [AudioDeviceID: [InputUser]] = [:]
+        for process in HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList) {
+            guard HAL.read(process, kAudioProcessPropertyIsRunningInput, initial: UInt32(0)) == 1,
+                  let pid = HAL.read(process, kAudioProcessPropertyPID, initial: pid_t(0)), pid != getpid(),
+                  case .app(let key, let name, _) = AudioOwner(pid: pid, processObject: process, running: running) else { continue }
+            for device in HAL.ids(process, kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeInput) where !(users[device]?.contains { $0.id == key } ?? false) {
+                users[device, default: []].append(InputUser(id: key, name: name))
+            }
+        }
+        return users.mapValues { $0.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending } }
     }
 
     private func volumeChannels(_ device: AudioDeviceID, input: Bool) -> [UInt32] {
@@ -193,15 +280,21 @@ final class AudioController: ObservableObject {
         writeVolume(source, volume)
     }
 
-    private func writeVolume(_ source: AudioSource, _ volume: Double) {
+    @discardableResult
+    private func writeVolume(_ source: AudioSource, _ volume: Double) -> Bool {
         let clamped = min(1, max(0, volume))
         for channel in source.channels {
             var property = address(kAudioDevicePropertyVolumeScalar, input: source.input, channel: channel)
             var value = Float32(clamped)
             let status = AudioObjectSetPropertyData(source.device, &property, 0, nil, UInt32(MemoryLayout<Float32>.size), &value)
-            if status != noErr { error = "Couldn’t change \(source.name)’s volume (\(status))."; refresh(); return }
+            if status != noErr {
+                if volumeWriteFailures.insert(source.id).inserted { error = "Couldn’t change \(source.name)’s volume (\(status))." }
+                return false
+            }
         }
+        volumeWriteFailures.remove(source.id)
         if let index = sources.firstIndex(where: { $0.id == source.id }) { sources[index].volume = clamped }
+        return true
     }
 
     func toggleMute(_ source: AudioSource) {
@@ -246,6 +339,12 @@ struct RouteKey: Hashable {
     let source: String
     let output: String
 }
+/// An app recording from an input.
+struct InputUser: Equatable {
+    let id: String
+    let name: String
+}
+
 struct MixerProfile: Codable, Identifiable {
     var id = UUID()
     var name: String
@@ -259,7 +358,26 @@ struct MixerProfile: Codable, Identifiable {
 }
 
 extension AudioController {
-    func toggleSoundMute() { soundMuted.toggle(); updateMute(input: false) }
+    func toggleSoundMute() {
+        // Muted outside Voidamp (another app, before launch): the first press clears that instead.
+        if !soundMuted, let output = sources.first(where: { !$0.input && $0.isDefault }), output.hardwareMuted {
+            setHardwareMute(output, false)
+            return
+        }
+        soundMuted.toggle()
+        updateMute(input: false)
+    }
+    /// Unmutes sound however it was muted, for the volume keys: turning the volume up should be heard.
+    func unmuteSound() {
+        if soundMuted || (sources.first(where: { !$0.input && $0.isDefault })?.hardwareMuted ?? false) { toggleSoundMute() }
+    }
+    private func setHardwareMute(_ source: AudioSource, _ muted: Bool) {
+        var property = address(kAudioDevicePropertyMute, input: source.input)
+        var value: UInt32 = muted ? 1 : 0
+        let status = AudioObjectSetPropertyData(source.device, &property, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value)
+        if status != noErr { error = "Couldn’t \(muted ? "mute" : "unmute") \(source.name) (\(status))."; return }
+        if let index = sources.firstIndex(where: { $0.id == source.id }) { sources[index].hardwareMuted = muted }
+    }
     func toggleMicMute() { micMuted.toggle(); updateMute(input: true) }
 
     private func updateMute(input: Bool) {
@@ -274,7 +392,18 @@ extension AudioController {
                 writeVolume(source, previous)
             }
         }
-        if !input { applyRouteGains() } else { applyMonitorGains() }
+        if !muted { volumeWriteFailures.removeAll() }
+        // Routes into virtual mics follow the Mic button, so both kinds can change.
+        applyRouteGains()
+        applyMonitorGains()
+    }
+
+    /// Devices unplugged while muted keep their level to return to; restore it when they come back unmuted.
+    private func restorePendingVolumes() {
+        for source in sources where !(source.input ? micMuted : soundMuted) && !source.channels.isEmpty {
+            guard let held = mutedDevices[source.id], nativeMuteStates[source.id] == nil else { continue }
+            if writeVolume(source, held) { mutedDevices.removeValue(forKey: source.id) }
+        }
     }
 
     private func enforceMute() {
@@ -282,7 +411,7 @@ extension AudioController {
             if useHardwareMute(source, muted: true) { continue }
             guard !source.channels.isEmpty else { continue }
             if mutedDevices[source.id] == nil { mutedDevices[source.id] = source.volume }
-            if source.volume != 0 { writeVolume(source, 0) }
+            if source.volume != 0, !volumeWriteFailures.contains(source.id) { writeVolume(source, 0) }
         }
     }
 
@@ -294,10 +423,13 @@ extension AudioController {
               settable.boolValue,
               let current = scalar(source.device, property, initial: UInt32(0)) else { return false }
         if muted, nativeMuteStates[source.id] == nil { nativeMuteStates[source.id] = current }
-        var value: UInt32 = muted ? 1 : (nativeMuteStates.removeValue(forKey: source.id) ?? current)
+        // Unmuting always unmutes, even a device that was already muted when Voidamp muted it.
+        if !muted { nativeMuteStates.removeValue(forKey: source.id) }
+        var value: UInt32 = muted ? 1 : 0
         if value != current {
             let status = AudioObjectSetPropertyData(source.device, &property, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value)
             if status != noErr { error = "Couldn’t mute \(source.name) (\(status))."; return false }
+            if let index = sources.firstIndex(where: { $0.id == source.id }) { sources[index].hardwareMuted = value == 1 }
         }
         return true
     }
@@ -317,11 +449,13 @@ extension AudioController {
         mixingEnabled = true
         clearFailures()
         refreshApps()
+        updateMonitors()
     }
     func disableMixing() {
         routes.removeAll() // Destroying taps restores the original application audio.
         mixingEnabled = false
         clearFailures()
+        updateMonitors() // Microphone wires pause with mixing, as the Suite shows.
     }
     /// Tries every app again, for example after allowing audio access in System Settings.
     func retryMixing() {
@@ -330,6 +464,9 @@ extension AudioController {
     }
     private func clearFailures() {
         failedProcesses.removeAll()
+        retryAt.removeAll()
+        failureCounts.removeAll()
+        silentFirstApps.removeAll()
         if !routeFailures.isEmpty { routeFailures.removeAll() }
         if captureBlocked { captureBlocked = false }
     }
@@ -347,7 +484,10 @@ extension AudioController {
             case .app(let key, let name, let icon):
                 groups[key, default: (name, icon, [])].processes.append(id)
             case .system:
-                guard showSystemSounds else { continue }
+                // Speech, VoiceOver, Siri and calls come from macOS too, but they aren't sound effects: lowering
+                // or moving System Sounds must not silence them, so they play untouched.
+                let bundle = (HAL.string(id, kAudioProcessPropertyBundleID) ?? "").lowercased()
+                guard showSystemSounds, !["voiceover", "speech", "siri", "assistant", "avconference", "callservices", "telephony"].contains(where: bundle.contains) else { continue }
                 groups[AppSource.systemSoundsID, default: ("System Sounds", nil, [])].processes.append(id)
             }
         }
@@ -392,7 +532,7 @@ extension AudioController {
         // Wired elsewhere than the default output. System Sounds move with macOS's alert device instead.
         guard id != AppSource.systemSoundsID, let defaultOutput = defaultOutputSource else { return false }
         let wired = wiredTargets(id)
-        return !wired.isEmpty && wired.map(\.uid) != [defaultOutput.uid]
+        return !wired.isEmpty && wired.map(\.uid) != [(ownOutput(id) ?? defaultOutput).uid]
     }
     /// The Suite's wires from an app to outputs that are present, while the Suite is on.
     private func wiredTargets(_ id: String) -> [AudioSource] {
@@ -400,14 +540,20 @@ extension AudioController {
         return (appSettings[id]?.outputs ?? []).compactMap { uid in sources.first { !$0.input && $0.uid == uid } }
     }
     /// The output an app plays on by its own choice, such as Discord or a music app with its own device setting.
+    /// A paused app has no processes to ask, so it keeps the device it last chose while that wasn't the default.
     private func ownOutput(_ id: String) -> AudioSource? {
-        guard let app = apps.first(where: { $0.id == id }) else { return nil }
-        for process in app.processes {
-            for device in HAL.ids(process, kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeOutput) {
-                if let source = sources.first(where: { !$0.input && $0.device == device }) { return source }
+        if let app = apps.first(where: { $0.id == id }), !app.processes.isEmpty {
+            for process in app.processes {
+                for device in HAL.ids(process, kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeOutput) {
+                    guard let source = sources.first(where: { !$0.input && $0.device == device }) else { continue }
+                    if source.isDefault { lastOwnOutputs.removeValue(forKey: id) } else { lastOwnOutputs[id] = source.uid }
+                    return source
+                }
             }
+            lastOwnOutputs.removeValue(forKey: id)
+            return nil
         }
-        return nil
+        return lastOwnOutputs[id].flatMap { uid in sources.first { !$0.input && $0.uid == uid } }
     }
     private var defaultOutputSource: AudioSource? { sources.first { !$0.input && $0.isDefault } }
     /// Where an app plays: its wires that are present, otherwise the output the app chose itself or the default
@@ -417,9 +563,12 @@ extension AudioController {
         let wired = wiredTargets(id)
         return wired.isEmpty ? [ownOutput(id) ?? defaultOutput] : wired
     }
-    private func effectiveGain(_ id: String) -> Double {
-        let setting = appSettings[id] ?? .unchanged
-        return soundMuted || setting.muted || silencedByPatchbay(id) ? 0 : setting.gain
+    /// A route's level: the app's own level and mute, patchbay silence, and the Sound button, or the Mic button for
+    /// routes into a virtual mic, since those are what the other side of a call hears.
+    private func routeGain(_ key: RouteKey) -> Double {
+        let setting = appSettings[key.source] ?? .unchanged
+        let globallyMuted = key.output.hasPrefix(VirtualMics.uidPrefix) ? micMuted : soundMuted
+        return globallyMuted || setting.muted || silencedByPatchbay(key.source) ? 0 : setting.gain
     }
     /// In patchbay mode, an app on the board without any wire plays nowhere. An app whose wired output is merely
     /// disconnected still falls back to the default output, so a Bluetooth speaker turning off doesn't silence it.
@@ -433,14 +582,16 @@ extension AudioController {
         return Set(board.keys.filter { $0.hasPrefix("app:") }.map { String($0.dropFirst(4)) })
     }
     private func applyRouteGains() {
-        for (key, route) in routes { route.setGain(effectiveGain(key.source)) }
+        for (key, route) in routes { route.setGain(routeGain(key)) }
     }
 
     private func updateRoutes(live: Set<AudioObjectID>, now: Date) {
-        guard mixingEnabled, let output = defaultOutputSource else {
+        guard mixingEnabled else {
             routes.removeAll()
             return
         }
+        // While the default output reads as missing for a moment (switching devices), keep what plays.
+        guard let output = defaultOutputSource else { return }
         if routeOutputUID != output.uid {
             // A new output can behave differently, so give every app another chance.
             routeOutputUID = output.uid
@@ -449,9 +600,8 @@ extension AudioController {
         }
         var wanted: [String: [AudioSource]] = [:]
         for app in apps where needsRoute(app.id) { wanted[app.id] = routeTargets(app.id, defaultOutput: output) }
-        for key in routes.keys where !(wanted[key.source]?.contains { $0.uid == key.output } ?? false) {
-            routes.removeValue(forKey: key)
-        }
+        // Routes no longer wanted go once their replacements exist, so the app isn't briefly unrouted.
+        let obsolete = routes.keys.filter { key in !(wanted[key.source]?.contains { $0.uid == key.output } ?? false) }
         for app in apps {
             guard let targets = wanted[app.id] else { continue }
             var keep: Set<AudioObjectID> = []
@@ -464,14 +614,16 @@ extension AudioController {
                 case .neverStarted:
                     failed = true
                 case .stalled:
-                    // Callbacks stopped after working, e.g. after sleep. Rebuild so the app isn't left silent.
-                    routes.removeValue(forKey: key); missing.append(target)
+                    // Callbacks stopped after working, e.g. after sleep. Rebuild so the app isn't left silent;
+                    // the new route replaces this one once it exists.
+                    missing.append(target)
                 case .healthy:
                     captureConfirmed = true
+                    if routeFailures[app.id] != nil || failedProcesses[app.id] != nil { forgetFailure(app.id) }
                     let current = route.processes.filter(live.contains)
                     if current.count != route.processes.count || !Set(app.processes).isSubset(of: route.processes) {
                         // A helper quit or a new one started; its tap can't be reused.
-                        routes.removeValue(forKey: key); missing.append(target)
+                        missing.append(target)
                         keep.formUnion(current)
                     }
                     // Paused apps keep their route until they leave the list.
@@ -488,6 +640,7 @@ extension AudioController {
             guard app.isPlaying else { continue }
             for target in missing { startRoute(for: app, including: keep, output: target) }
         }
+        for key in obsolete { routes.removeValue(forKey: key) }
         // A route that stays (same app, same output) can still need a new level: patchbay mode silences an app
         // whose last wire went to the output it falls back to.
         applyRouteGains()
@@ -497,7 +650,9 @@ extension AudioController {
     /// Delays each app's faster outputs so all of its outputs play in step: Bluetooth runs far behind built-in
     /// speakers. Uses the latency each device reports, plus the user's sync offset for that output.
     private func alignRoutes() {
-        let bySource = Dictionary(grouping: routes, by: { $0.key.source })
+        // Virtual mics go to the other side of a call, not to a room with speakers: never delayed to match them.
+        for (key, route) in routes where key.output.hasPrefix(VirtualMics.uidPrefix) { route.setDelay(seconds: 0) }
+        let bySource = Dictionary(grouping: routes.filter { !$0.key.output.hasPrefix(VirtualMics.uidPrefix) }, by: { $0.key.source })
         for (_, group) in bySource {
             guard group.count > 1 else {
                 group.first?.value.setDelay(seconds: 0)
@@ -512,14 +667,10 @@ extension AudioController {
     private func startRoute(for app: AppSource, including extra: Set<AudioObjectID> = [], output: AudioSource) {
         let processes = Set(app.processes).union(extra)
         guard !captureBlocked, !processes.isEmpty else { return }
-        if let failed = failedProcesses[app.id] {
-            guard failed != processes else { return }
-            // Different processes play now (a helper restarted), so try once more.
-            failedProcesses.removeValue(forKey: app.id)
-            routeFailures.removeValue(forKey: app.id)
-        }
+        if let failed = failedProcesses[app.id], failed == processes, Date() < retryAt[app.id] ?? .distantFuture { return }
         do {
-            routes[RouteKey(source: app.id, output: output.uid)] = try AppRoute(processes: processes.sorted(), output: output.device, gain: effectiveGain(app.id))
+            let key = RouteKey(source: app.id, output: output.uid)
+            routes[key] = try AppRoute(processes: processes.sorted(), output: output.device, gain: routeGain(key))
         } catch {
             for key in routes.keys where key.source == app.id { routes.removeValue(forKey: key) }
             fail(app, .message(error.localizedDescription))
@@ -529,12 +680,26 @@ extension AudioController {
     private func fail(_ app: AppSource, _ failure: RouteFailure) {
         failedProcesses[app.id] = Set(app.processes)
         routeFailures[app.id] = failure
+        // Try again after 10 s, then 20, 40 … up to 5 minutes: a device that was slow to wake gets another chance.
+        let count = (failureCounts[app.id] ?? 0) + 1
+        failureCounts[app.id] = count
+        retryAt[app.id] = Date().addingTimeInterval(min(300, 10 * pow(2, Double(count - 1))))
         if failure == .noAudio {
-            // Nothing has ever been captured: every other route would fail the same way and briefly
-            // silence its app. Hold off until Retry.
-            captureBlocked = true
-            routes.removeAll()
+            // Two apps capturing nothing before anything ever worked points at the permission: every other route
+            // would fail the same way and briefly silence its app. Hold off until Retry.
+            silentFirstApps.insert(app.id)
+            if silentFirstApps.count >= 2 {
+                captureBlocked = true
+                routes.removeAll()
+            }
         }
+    }
+
+    private func forgetFailure(_ id: String) {
+        failedProcesses.removeValue(forKey: id)
+        routeFailures.removeValue(forKey: id)
+        retryAt.removeValue(forKey: id)
+        failureCounts.removeValue(forKey: id)
     }
 
     func routingDiagnostics() -> [String] {
@@ -574,7 +739,7 @@ extension AudioController {
             apps[index].muted = setting.muted
         }
         let appRoutes = routes.filter { $0.key.source == app.id }
-        for route in appRoutes.values { route.setGain(effectiveGain(app.id)) }
+        for (key, route) in appRoutes { route.setGain(routeGain(key)) }
         // A level change on a routed app only changes gains; anything else may add or remove routes.
         let targets = defaultOutputSource.map { routeTargets(app.id, defaultOutput: $0).map(\.uid) } ?? []
         if !needsRoute(app.id) || Set(appRoutes.keys.map(\.output)) != Set(targets) {
@@ -589,12 +754,18 @@ extension AudioController {
     func saveProfile(name: String) {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
-        let profile = MixerProfile(name: name,
+        var profile = MixerProfile(name: name,
             devices: Dictionary(uniqueKeysWithValues: sources.filter { !$0.channels.isEmpty }.map { ($0.id, mutedDevices[$0.id] ?? $0.volume) }),
             outputUID: sources.first { !$0.input && $0.isDefault }?.uid,
             inputUID: sources.first { $0.input && $0.isDefault }?.uid,
             apps: appSettings.filter { $0.value != .unchanged }, soundMuted: soundMuted, micMuted: micMuted, mixingEnabled: mixingEnabled)
-        profiles.append(profile)
+        // Saving under an existing name updates that profile instead of adding a second one with the same name.
+        if let index = profiles.firstIndex(where: { $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame }) {
+            profile.id = profiles[index].id
+            profiles[index] = profile
+        } else {
+            profiles.append(profile)
+        }
         selectedProfile = profile.id
         persistProfiles()
     }
@@ -628,6 +799,7 @@ extension AudioController {
         watcher = nil
         disableMixing()
         monitors.removeAll()
+        stopListening()
         if soundMuted { toggleSoundMute() }
         if micMuted { toggleMicMute() }
         timer?.invalidate()
@@ -739,10 +911,7 @@ extension AudioController {
 
 extension AudioController {
     /// macOS's output for alerts and sound effects.
-    var alertOutput: AudioSource? {
-        guard let id = HAL.read(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultSystemOutputDevice, initial: AudioDeviceID(0)) else { return nil }
-        return sources.first { !$0.input && $0.device == id }
-    }
+    var alertOutput: AudioSource? { sources.first { !$0.input && $0.device == alertDevice } }
 
     /// The outputs an app is wired to, including ones that are disconnected right now.
     func wiredOutputs(_ app: AppSource) -> [String] {
@@ -751,31 +920,29 @@ extension AudioController {
     }
 
     func connect(_ app: AppSource, to output: AudioSource) {
-        if app.isSystem { setAlertOutput(output); return }
+        if app.isSystem {
+            // Remember the alert device the Suite replaces, to put it back when System Sounds are unwired.
+            if alertBeforeSuite == nil, let current = alertOutput { alertBeforeSuite = current.uid }
+            setAlertOutput(output)
+            return
+        }
         var outputs = appSettings[app.id]?.outputs ?? []
         guard !outputs.contains(output.uid) else { return }
         // The first wire replaces the implicit default.
         outputs.append(output.uid)
         // Routing needs a capture even for apps that can't be mixed yet; give them another chance.
-        if routeFailures[app.id] != nil { failedProcesses.removeValue(forKey: app.id); routeFailures.removeValue(forKey: app.id) }
+        if routeFailures[app.id] != nil { forgetFailure(app.id) }
         changeOutputs(app, outputs)
     }
 
     func disconnect(_ app: AppSource, from outputUID: String) {
-        if app.isSystem {
-            // Unwiring alerts returns them to the default output.
-            if let output = defaultOutputSource { setAlertOutput(output) }
-            return
-        }
+        if app.isSystem { restoreAlertOutput(); return }
         changeOutputs(app, (appSettings[app.id]?.outputs ?? []).filter { $0 != outputUID })
     }
 
-    /// Removes every wire from an app; System Sounds go back to the default output.
+    /// Removes every wire from an app; System Sounds go back to the alert device they had before the Suite.
     func clearWiring(_ app: AppSource) {
-        if app.isSystem {
-            if let output = defaultOutputSource, alertOutput?.uid != output.uid { setAlertOutput(output) }
-            return
-        }
+        if app.isSystem { restoreAlertOutput(); return }
         if !(appSettings[app.id]?.outputs ?? []).isEmpty { changeOutputs(app, []) }
     }
 
@@ -791,7 +958,7 @@ extension AudioController {
             objectWillChange.send()
             updateRoutes(live: Set(HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList)), now: Date())
         }
-        if alertOutput?.uid == uid, let output = defaultOutputSource, output.uid != uid { setAlertOutput(output) }
+        // The alert device is macOS's setting: removing an output from the board leaves it alone.
         for (input, outputs) in monitorWiring where outputs.contains(uid) {
             monitorWiring[input] = outputs.filter { $0 != uid }
             if monitorWiring[input]?.isEmpty == true { monitorWiring.removeValue(forKey: input) }
@@ -814,7 +981,7 @@ extension AudioController {
     }
 
     /// Whether patchbay mode keeps this app silent, for the panel and the Suite.
-    func isSilencedByPatchbay(_ app: AppSource) -> Bool { mixingEnabled && silencedByPatchbay(app.id) }
+    func isSilencedByPatchbay(_ app: AppSource) -> Bool { mixingEnabled && canAdjust(app) && silencedByPatchbay(app.id) }
 
     /// Called when apps are placed on or removed from the board, which matters in patchbay mode.
     func boardChanged() {
@@ -822,35 +989,15 @@ extension AudioController {
         updateRoutes(live: Set(HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList)), now: Date())
     }
 
-    /// The ids of apps recording from an input right now.
-    func appIDsUsing(input: AudioSource) -> [String] {
-        let running = NSWorkspace.shared.runningApplications
-        var ids: [String] = []
-        for process in HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList) {
-            guard HAL.read(process, kAudioProcessPropertyIsRunningInput, initial: UInt32(0)) == 1,
-                  let pid = HAL.read(process, kAudioProcessPropertyPID, initial: pid_t(0)), pid != getpid(),
-                  HAL.ids(process, kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeInput).contains(input.device) else { continue }
-            if case .app(let key, _, _) = AudioOwner(pid: pid, processObject: process, running: running), !ids.contains(key) { ids.append(key) }
-        }
-        return ids
-    }
+    /// The ids of apps recording from an input right now, as of the last refresh.
+    func appIDsUsing(input: AudioSource) -> [String] { (inputUsers[input.device] ?? []).map(\.id) }
 
-    /// The apps recording from an input right now, by name.
-    func appsUsing(input: AudioSource) -> [String] {
-        let running = NSWorkspace.shared.runningApplications
-        var names: [String] = []
-        for process in HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList) {
-            guard HAL.read(process, kAudioProcessPropertyIsRunningInput, initial: UInt32(0)) == 1,
-                  let pid = HAL.read(process, kAudioProcessPropertyPID, initial: pid_t(0)), pid != getpid(),
-                  HAL.ids(process, kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeInput).contains(input.device) else { continue }
-            if case .app(_, let name, _) = AudioOwner(pid: pid, processObject: process, running: running), !names.contains(name) { names.append(name) }
-        }
-        return names.sorted()
-    }
+    /// The apps recording from an input right now, by name, as of the last refresh.
+    func appsUsing(input: AudioSource) -> [String] { (inputUsers[input.device] ?? []).map(\.name) }
 
     /// Whether a microphone is being played on an output, so the panel can show that you hear yourself.
     var monitoringActive: Bool {
-        guard suiteEnabled else { return false }
+        guard suiteEnabled, mixingEnabled else { return false }
         return monitorWiring.contains { input, outputs in
             // Feeding a virtual mic isn't hearing yourself.
             sources.contains { $0.input && $0.uid == input } && outputs.contains { uid in sources.contains { !$0.input && !$0.isVirtualMic && $0.uid == uid } }
@@ -866,12 +1013,19 @@ extension AudioController {
         updateRoutes(live: Set(HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList)), now: Date())
     }
 
+    /// Puts System Sounds back on the device they used before the Suite moved them; leaves them alone when the
+    /// Suite never moved them.
+    private func restoreAlertOutput() {
+        guard let previous = alertBeforeSuite else { return }
+        alertBeforeSuite = nil
+        if let output = sources.first(where: { !$0.input && $0.uid == previous }) ?? defaultOutputSource { setAlertOutput(output) }
+    }
+
     private func setAlertOutput(_ output: AudioSource) {
         var property = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultSystemOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
         var value = output.device
         let status = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &property, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &value)
-        if status != noErr { error = "Couldn’t play alerts on \(output.name) (\(status))." }
-        objectWillChange.send()
+        if status != noErr { error = "Couldn’t play alerts on \(output.name) (\(status))." } else { alertDevice = output.device }
         refreshApps()
     }
 
@@ -927,13 +1081,18 @@ extension AudioController {
     /// Starts and stops monitors to match the wiring and the devices present.
     func updateMonitors() {
         var wanted: [RouteKey: (AudioSource, AudioSource)] = [:]
-        for (inputUID, outputUIDs) in monitorWiring where suiteEnabled {
+        for (inputUID, outputUIDs) in monitorWiring where suiteEnabled && mixingEnabled {
             guard let input = sources.first(where: { $0.input && $0.uid == inputUID }) else { continue }
             for uid in outputUIDs {
                 if let output = sources.first(where: { !$0.input && $0.uid == uid }) { wanted[RouteKey(source: inputUID, output: uid)] = (input, output) }
             }
         }
-        for (key, monitor) in monitors where wanted[key] == nil || monitor.stalled() { monitors.removeValue(forKey: key) }
+        for (key, monitor) in monitors where wanted[key] == nil || monitor.stalled() {
+            if wanted[key] != nil { monitorStalls[key, default: 0] += 1 }
+            monitors.removeValue(forKey: key)
+        }
+        // Forget stalls of wires that are gone, so wiring again starts fresh.
+        monitorStalls = monitorStalls.filter { wanted[$0.key] != nil }
         guard !wanted.isEmpty else {
             if !monitorFailures.isEmpty { monitorFailures.removeAll() }
             return
@@ -946,6 +1105,11 @@ extension AudioController {
         }
         var failures: [String: String] = [:]
         for (key, pair) in wanted where monitors[key] == nil {
+            // A monitor that keeps stopping (a device that never runs) isn't rebuilt every few seconds forever.
+            if monitorStalls[key, default: 0] >= 3 {
+                failures[key.source] = "\(pair.1.name) stopped responding. Wire it again to retry."
+                continue
+            }
             do {
                 monitors[key] = try MonitorRoute(input: pair.0.device, output: pair.1.device, gain: micMuted ? 0 : monitorGains[key.source] ?? 1)
             } catch {
@@ -1025,8 +1189,9 @@ extension AudioController {
     }
     /// Whether an output plays an app that also plays on another output, so syncing applies.
     func sharesSource(_ output: AudioSource) -> Bool {
+        guard !output.isVirtualMic else { return false }
         let sourcesHere = Set(routes.keys.filter { $0.output == output.uid }.map(\.source))
-        return routes.keys.contains { sourcesHere.contains($0.source) && $0.output != output.uid }
+        return routes.keys.contains { sourcesHere.contains($0.source) && $0.output != output.uid && !$0.output.hasPrefix(VirtualMics.uidPrefix) }
     }
 
     /// The output an app without wires plays on: the one it chose itself, or the default output.
@@ -1037,27 +1202,14 @@ extension AudioController {
 
     // An output's own mute: the device's mute switch when it has one, otherwise its volume.
 
-    func canMute(_ output: AudioSource) -> Bool {
-        var property = address(kAudioDevicePropertyMute)
-        var settable: DarwinBoolean = false
-        let hardware = AudioObjectHasProperty(output.device, &property) && AudioObjectIsPropertySettable(output.device, &property, &settable) == noErr && settable.boolValue
-        return hardware || !output.channels.isEmpty
-    }
+    func canMute(_ output: AudioSource) -> Bool { output.hasMuteSwitch || !output.channels.isEmpty }
     func isMuted(_ output: AudioSource) -> Bool {
-        var property = address(kAudioDevicePropertyMute)
-        if AudioObjectHasProperty(output.device, &property) { return scalar(output.device, property, initial: UInt32(0)) == 1 }
-        return !output.channels.isEmpty && output.volume == 0
+        let live = sources.first(where: { $0.id == output.id }) ?? output
+        return live.hasMuteSwitch ? live.hardwareMuted : !live.channels.isEmpty && live.volume == 0
     }
     func toggleMute(output: AudioSource) {
-        var property = address(kAudioDevicePropertyMute)
-        var settable: DarwinBoolean = false
-        if AudioObjectHasProperty(output.device, &property), AudioObjectIsPropertySettable(output.device, &property, &settable) == noErr, settable.boolValue {
-            var value: UInt32 = isMuted(output) ? 0 : 1
-            let status = AudioObjectSetPropertyData(output.device, &property, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value)
-            if status != noErr { error = "Couldn’t mute \(output.name) (\(status))." }
-            objectWillChange.send()
-        } else if !output.channels.isEmpty {
-            toggleMute(output)
-        }
+        let live = sources.first(where: { $0.id == output.id }) ?? output
+        if live.hasMuteSwitch { setHardwareMute(live, !live.hardwareMuted) }
+        else if !live.channels.isEmpty { toggleMute(live) }
     }
 }

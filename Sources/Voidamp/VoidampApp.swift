@@ -17,31 +17,22 @@ final class VoidampRuntime: ObservableObject {
         closePanel()
         SuiteWindowController.shared.show()
     }
+    func openSettings() {
+        closePanel()
+        SuiteWindowController.shared.show(tab: .settings)
+    }
 
-    /// The More menu, shared by the panel's ellipsis button and a right-click on the menu bar icon.
+    /// The More menu, shared by the panel's ellipsis button and a right-click on the menu bar icon. Settings live
+    /// in the Suite; this keeps what is reached for quickly.
     func moreMenu() -> NSMenu {
         let menu = NSMenu()
         menu.addItem(ClosureMenuItem("Open Voidamp Suite…") { [weak self] in self?.openSuite() })
+        menu.addItem(ClosureMenuItem("Settings…") { [weak self] in self?.openSettings() })
         let profiles = NSMenuItem(title: "Profiles", action: nil, keyEquivalent: "")
         profiles.submenu = profilesMenu()
         menu.addItem(profiles)
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem("Check for Updates…", enabled: updater.canCheckForUpdates) { [updater] in updater.checkForUpdates() })
-        menu.addItem(ClosureMenuItem("Refresh sources") { [audio] in audio.refresh() })
-        menu.addItem(.separator())
-        menu.addItem(ClosureMenuItem("Show System Sounds in Mixing", checked: audio.showSystemSounds) { [audio] in audio.showSystemSounds.toggle() })
-        menu.addItem(ClosureMenuItem("Start at Login", checked: loginItem.enabled) { [loginItem] in loginItem.setEnabled(!loginItem.enabled) })
-        if let overlay {
-            menu.addItem(ClosureMenuItem("Volume & Brightness Overlay", checked: overlay.enabled) { overlay.enabled.toggle() })
-            if overlay.enabled && !overlay.trusted {
-                menu.addItem(ClosureMenuItem("Allow Accessibility for the Overlay…") {
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                })
-            }
-        }
-        if loginItem.needsApproval {
-            menu.addItem(ClosureMenuItem("Approve Start at Login…") { [loginItem] in loginItem.openSettings() })
-        }
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem("Quit Voidamp") { [audio] in audio.shutDown(); NSApplication.shared.terminate(nil) })
         return menu
@@ -62,25 +53,40 @@ final class VoidampRuntime: ObservableObject {
         }
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem("Save Current as Profile…") { [weak self] in self?.askToSaveProfile() })
-        if let id = audio.selectedProfile, let name = audio.profiles.first(where: { $0.id == id })?.name {
-            menu.addItem(ClosureMenuItem("Delete “\(name)”") { [audio] in audio.deleteProfile(id) })
+        if !audio.profiles.isEmpty {
+            // Any profile can be deleted without applying it first.
+            let delete = NSMenuItem(title: "Delete Profile", action: nil, keyEquivalent: "")
+            let choices = NSMenu()
+            for profile in audio.profiles {
+                choices.addItem(ClosureMenuItem(profile.name) { [audio] in audio.deleteProfile(profile.id) })
+            }
+            delete.submenu = choices
+            menu.addItem(delete)
         }
         return menu
     }
 
-    private func askToSaveProfile() {
+    /// Asks for a name until one is given; a name in use updates that profile.
+    func askToSaveProfile() {
         closePanel()
         NSApplication.shared.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = "Save Profile"
-        alert.informativeText = "Saves the current devices, levels, mutes and the Suite’s app wiring."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        field.placeholderString = "Profile name"
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Cancel")
-        alert.window.initialFirstResponder = field
-        if alert.runModal() == .alertFirstButtonReturn { audio.saveProfile(name: field.stringValue) }
+        var hint = "Saves the current devices, levels, mutes and the Suite’s app wiring."
+        while true {
+            let alert = NSAlert()
+            alert.messageText = "Save Profile"
+            alert.informativeText = hint
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+            field.placeholderString = "Profile name"
+            alert.accessoryView = field
+            alert.addButton(withTitle: "Save")
+            alert.addButton(withTitle: "Cancel")
+            alert.window.initialFirstResponder = field
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if name.isEmpty { hint = "Give the profile a name."; continue }
+            audio.saveProfile(name: name)
+            return
+        }
     }
 }
 
@@ -93,10 +99,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var outsideClickMonitor: Any?
     private var keyMonitor: Any?
     private var lastClose = Date.distantPast
+    private var keepActiveOnClose = false
     private var previewWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
+        // Screenshot modes for development; not part of release builds.
+        #if DEBUG
         // `--overlay-snapshot <png> [--light]` renders the volume overlay card for review and quits.
         if let index = CommandLine.arguments.firstIndex(of: "--overlay-snapshot"), CommandLine.arguments.indices.contains(index + 1) {
             OverlaySnapshot.render(to: CommandLine.arguments[index + 1], dark: !CommandLine.arguments.contains("--light"))
@@ -125,10 +134,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         // `--suite-preview` opens only the Suite, for screenshots, and prints its window number.
         if CommandLine.arguments.contains("--suite-preview") {
-            SuiteWindowController.shared.show()
+            // `--settings` opens it on the Settings tab.
+            SuiteWindowController.shared.show(tab: CommandLine.arguments.contains("--settings") ? .settings : nil)
             if let number = SuiteWindowController.shared.windowNumber { print("window \(number)"); fflush(stdout) }
             return
         }
+        #endif
         if CommandLine.arguments.contains("--updater-check") {
             let updater = VoidampRuntime.shared.updater
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
@@ -142,7 +153,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         configureStatusItem()
-        VoidampRuntime.shared.closePanel = { [weak self] in self?.closePanel() }
+        // Closing the panel to open something else keeps Voidamp in front.
+        VoidampRuntime.shared.closePanel = { [weak self] in
+            self?.keepActiveOnClose = true
+            self?.closePanel()
+            self?.keepActiveOnClose = false
+        }
         let overlay = ControlOverlay(audio: VoidampRuntime.shared.audio, panelShown: { [weak self] in self?.popover.isShown ?? false })
         VoidampRuntime.shared.overlay = overlay
         overlay.start()
@@ -263,6 +279,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func popoverDidClose(_ notification: Notification) {
         lastClose = Date()
         statusItem?.button?.highlight(false)
+        // Hand the keyboard back to the app that was in front, unless the panel closed to open something of Voidamp's.
+        if !keepActiveOnClose, !SuiteWindowController.shared.isOpen { NSApplication.shared.hide(nil) }
+    }
+
+    /// Opening Voidamp again (for example when its icon is hidden behind the notch) opens the Suite.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { SuiteWindowController.shared.show() }
+        return false
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -287,6 +311,8 @@ struct VoidampApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     init() {
+        // Development checks that create real routes; not part of release builds.
+        #if DEBUG
         if CommandLine.arguments.contains("--route-check") {
             // Uses its own preferences so the check never changes the user's saved levels.
             let suite = "app.voidamp.route-check.\(UUID().uuidString)"
@@ -345,6 +371,7 @@ struct VoidampApp: App {
             controller.shutDown()
             exit(0)
         }
+        #endif
         if CommandLine.arguments.contains("--self-check") {
             let suite = "app.voidamp.check.\(UUID().uuidString)"
             let preferences = UserDefaults(suiteName: suite)!
@@ -376,13 +403,28 @@ struct VoidampApp: App {
             precondition(older == AppSetting(gain: 1.5, muted: true) && older.outputs.isEmpty)
             let wired = AppSetting(gain: 1, muted: false, outputs: ["a", "b"])
             precondition(try! JSONDecoder().decode(AppSetting.self, from: JSONEncoder().encode(wired)) == wired)
+            // The delay line: no delay passes samples through; a delay returns earlier samples; a change blends.
+            let line = DelayLine(capacity: 100)
+            precondition(line.pass(0.5, channel: 0, frame: 0, frames: 1, from: 0, to: 0) == 0.5)
+            line.endBlock(frames: 1, delay: 0)
+            for frame in 0..<10 { _ = line.pass(Float(frame + 1), channel: 0, frame: frame, frames: 10, from: 0, to: 0) }
+            line.endBlock(frames: 10, delay: 0)
+            precondition(line.pass(100, channel: 0, frame: 0, frames: 1, from: 3, to: 3) == 8, "delay of 3 frames")
+            line.endBlock(frames: 1, delay: 3)
+            let blended = line.pass(200, channel: 0, frame: 1, frames: 3, from: 0, to: 2)
+            precondition(blended > 0 && blended < 200, "delay changes crossfade")
+            precondition(line.pass(1, channel: 5, frame: 0, frames: 1, from: 3, to: 3) == 1, "channels beyond stereo pass through")
+            // Saving a profile under an existing name updates it instead of adding another.
+            controller.saveProfile(name: "Desk")
+            controller.saveProfile(name: "desk")
+            precondition(controller.profiles.filter { $0.name.lowercased() == "desk" }.count == 1, "duplicate profile names")
             precondition(controller.apps.contains(where: \.isSystem), "System Sounds row missing")
             controller.showSystemSounds = false
             precondition(!controller.apps.contains(where: \.isSystem), "System Sounds row still shown")
             let hidden = AudioController(preferences: preferences, autoStartMixing: false)
             precondition(!hidden.showSystemSounds, "System Sounds setting not saved")
             hidden.shutDown()
-            print("PASS: stable device order, profile persistence/deletion, 100% snapping, gain bounds, System Sounds setting")
+            print("PASS: stable device order, profile persistence/deletion, 100% snapping, gain bounds, System Sounds setting, delay line, profile names")
             for source in controller.sources { print("\(source.input ? "Input" : "Output"): \(source.name) · \(source.channels.count) volume controls") }
             for app in controller.apps { print("App: \(app.name)") }
             controller.shutDown(); reloaded.shutDown(); deleted.shutDown()
@@ -392,7 +434,13 @@ struct VoidampApp: App {
     }
 
     var body: some Scene {
+        // Settings live in the Suite; ⌘, opens them there instead of an empty window.
         Settings { EmptyView() }
+            .commands {
+                CommandGroup(replacing: .appSettings) {
+                    Button("Settings…") { VoidampRuntime.shared.openSettings() }.keyboardShortcut(",")
+                }
+            }
     }
 }
 

@@ -19,7 +19,7 @@ Publishing is a separate explicit action. It uploads only the app archive and si
 
 Both `SURequireSignedFeed` and `SUVerifyUpdateBeforeExtraction` are enabled. Automatic checks are enabled by default; automatic installation is not. The More menu offers “Check for Updates…”. Sparkle validates signed archives before extracting them and presents its standard update interface.
 
-Sparkle signatures authenticate updates but do not provide Apple Developer ID signing or notarization. The first installation of this ad-hoc signed app may still require macOS approval. Existing installations without Sparkle need a one-time installation of this updater-enabled build. Developer ID signing and notarization remain recommended for wider distribution.
+Sparkle signatures authenticate updates but do not provide Apple Developer ID signing or notarization. The first installation of this self-signed app (“Voidamp Local Signing”) may still require macOS approval. Existing installations without Sparkle need a one-time installation of this updater-enabled build. Developer ID signing and notarization remain recommended for wider distribution.
 
 ## Verification
 

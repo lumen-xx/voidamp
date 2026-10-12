@@ -12,7 +12,10 @@ final class SuiteWindowController: NSObject, NSWindowDelegate {
     static let shared = SuiteWindowController()
     private var window: NSWindow?
 
-    func show() {
+    var isOpen: Bool { window?.isVisible ?? false }
+
+    func show(tab: SuiteTab? = nil) {
+        if let tab { SuiteNavigation.shared.tab = tab }
         if window == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 720),
                                   styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -28,13 +31,19 @@ final class SuiteWindowController: NSObject, NSWindowDelegate {
             if !window.setFrameUsingName("VoidampSuite") { window.center() }
             self.window = window
         }
-        // A Dock icon and Command-Tab entry while the Suite is open, like any other window.
+        // A Dock icon and Command-Tab entry while the Suite is open, like any other window. Activating once the
+        // policy change has landed keeps the window from opening behind the app in front.
         NSApplication.shared.setActivationPolicy(.regular)
-        NSApplication.shared.activate(ignoringOtherApps: true)
+        NSApplication.shared.unhide(nil)
         window?.makeKeyAndOrderFront(nil)
+        DispatchQueue.main.async { [weak self] in
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            self?.window?.makeKeyAndOrderFront(nil)
+        }
     }
 
     var windowNumber: Int? { window?.windowNumber }
+    var isOnScreen: Bool { window?.occlusionState.contains(.visible) ?? false }
 
     func windowWillClose(_ notification: Notification) {
         // Dropping the window stops its meters and animation.
@@ -83,61 +92,84 @@ enum SuiteMetrics {
     static let zoomRange: ClosedRange<CGFloat> = 0.5...1.5
 }
 
-/// What is on the board, where, and the view onto it. Positions are board points; the screen shows
-/// `board × zoom + pan`.
+/// What is on the board and where, in board points.
 @MainActor
 final class SuiteBoard: ObservableObject {
     @Published private(set) var placed: [String: CGPoint]
     /// Names of placed apps, so an app that isn't running keeps its node.
     @Published private(set) var names: [String: String]
-    @Published var zoom: CGFloat
-    @Published var pan: CGSize
     private let defaults = UserDefaults.standard
 
     init() {
         let stored = defaults.dictionary(forKey: "suiteBoard") as? [String: [Double]] ?? [:]
         placed = stored.compactMapValues { $0.count == 2 ? CGPoint(x: $0[0], y: $0[1]) : nil }
         names = defaults.dictionary(forKey: "suiteBoardNames") as? [String: String] ?? [:]
-        let view = defaults.array(forKey: "suiteBoardView") as? [Double] ?? []
-        zoom = view.count == 3 ? min(SuiteMetrics.zoomRange.upperBound, max(SuiteMetrics.zoomRange.lowerBound, view[0])) : 1
-        pan = view.count == 3 ? CGSize(width: view[1], height: view[2]) : .zero
     }
 
     func place(_ item: SuiteItem, at origin: CGPoint) {
         placed[item.id] = CGPoint(x: origin.x.rounded(), y: origin.y.rounded())
         if item.kind == .app { names[item.id] = item.title }
-        save()
+        save(routingChanged: true)
     }
+    /// Moving only changes the picture, so routing isn't recalculated.
     func move(_ id: String, to origin: CGPoint) {
         guard placed[id] != nil else { return }
         placed[id] = CGPoint(x: origin.x.rounded(), y: origin.y.rounded())
-        save()
+        save(routingChanged: false)
     }
     func remove(_ id: String) {
         placed.removeValue(forKey: id)
         names.removeValue(forKey: id)
-        save()
+        save(routingChanged: true)
     }
     func clear() {
         placed = [:]; names = [:]
-        save()
+        save(routingChanged: true)
     }
 
-    /// A free spot for an item added without dragging: below the others of its side.
-    func freeSpot(for item: SuiteItem) -> CGPoint {
-        let x: CGFloat = item.isSource ? 40 : 40 + SuiteMetrics.nodeSize.width + 260
-        let sameSide = placed.filter { $0.key.hasPrefix("out:") == !item.isSource }.values
-        let y = (sameSide.map(\.y).max().map { $0 + SuiteMetrics.nodeSize.height + 18 }) ?? 40
-        return CGPoint(x: x, y: y)
+    /// A free spot for an item added without dragging: at `center` (the middle of what's on screen), moved down
+    /// past any node already there.
+    func freeSpot(near center: CGPoint) -> CGPoint {
+        let size = SuiteMetrics.nodeSize
+        var origin = CGPoint(x: center.x - size.width / 2, y: center.y - size.height / 2)
+        while placed.values.contains(where: { abs($0.x - origin.x) < size.width * 0.5 && abs($0.y - origin.y) < size.height * 0.5 }) {
+            origin.y += size.height + 18
+        }
+        return origin
+    }
+
+    private func save(routingChanged: Bool) {
+        defaults.set(placed.mapValues { [Double($0.x), Double($0.y)] }, forKey: "suiteBoard")
+        defaults.set(names, forKey: "suiteBoardNames")
+        // In patchbay mode, placing or removing an app changes whether it plays.
+        if routingChanged { VoidampRuntime.shared.audio.boardChanged() }
+    }
+}
+
+/// The view onto the board: the screen shows `board × zoom + pan`. Separate from the board, so panning and zooming
+/// redraw only the canvas, not the sidebar.
+@MainActor
+final class SuiteViewport: ObservableObject {
+    @Published var zoom: CGFloat
+    @Published var pan: CGSize
+    /// The canvas size, kept by the canvas, for placing new nodes in view and fitting.
+    var size = CGSize(width: 800, height: 600)
+    private let defaults = UserDefaults.standard
+
+    init() {
+        let view = defaults.array(forKey: "suiteBoardView") as? [Double] ?? []
+        zoom = view.count == 3 ? min(SuiteMetrics.zoomRange.upperBound, max(SuiteMetrics.zoomRange.lowerBound, view[0])) : 1
+        pan = view.count == 3 ? CGSize(width: view[1], height: view[2]) : .zero
     }
 
     func toScreen(_ point: CGPoint) -> CGPoint { CGPoint(x: point.x * zoom + pan.width, y: point.y * zoom + pan.height) }
     func toBoard(_ point: CGPoint) -> CGPoint { CGPoint(x: (point.x - pan.width) / zoom, y: (point.y - pan.height) / zoom) }
-    func screenFrame(_ id: String) -> CGRect? {
-        guard let origin = placed[id] else { return nil }
+    func screenFrame(origin: CGPoint) -> CGRect {
         let size = SuiteMetrics.nodeSize
         return CGRect(origin: toScreen(origin), size: CGSize(width: size.width * zoom, height: size.height * zoom))
     }
+    /// The board point in the middle of the canvas.
+    var visibleCenter: CGPoint { toBoard(CGPoint(x: size.width / 2, y: size.height / 2)) }
 
     /// Zooms by `factor`, keeping the board point under `anchor` (a screen point) in place.
     func zoom(by factor: CGFloat, around anchor: CGPoint) {
@@ -146,16 +178,24 @@ final class SuiteBoard: ObservableObject {
         let ratio = next / zoom
         pan = CGSize(width: anchor.x - (anchor.x - pan.width) * ratio, height: anchor.y - (anchor.y - pan.height) * ratio)
         zoom = next
-        saveView()
+        save()
     }
-    func saveView() {
+
+    /// Zooms and pans so every node is in view, or back to the start when the board is empty.
+    func fit(_ origins: [CGPoint]) {
+        guard let first = origins.first else { zoom = 1; pan = .zero; save(); return }
+        let node = SuiteMetrics.nodeSize
+        var box = CGRect(origin: first, size: node)
+        for origin in origins.dropFirst() { box = box.union(CGRect(origin: origin, size: node)) }
+        let margin: CGFloat = 60
+        let fitted = min((size.width - margin * 2) / box.width, (size.height - margin * 2) / box.height)
+        zoom = min(SuiteMetrics.zoomRange.upperBound, max(SuiteMetrics.zoomRange.lowerBound, min(1, fitted)))
+        pan = CGSize(width: size.width / 2 - box.midX * zoom, height: size.height / 2 - box.midY * zoom)
+        save()
+    }
+
+    func save() {
         defaults.set([Double(zoom), Double(pan.width), Double(pan.height)], forKey: "suiteBoardView")
-    }
-    private func save() {
-        defaults.set(placed.mapValues { [Double($0.x), Double($0.y)] }, forKey: "suiteBoard")
-        defaults.set(names, forKey: "suiteBoardNames")
-        // In patchbay mode, placing an app without wires silences it.
-        VoidampRuntime.shared.audio.boardChanged()
     }
 }
 
@@ -212,14 +252,18 @@ final class SuiteMeters: ObservableObject {
     func start(_ audio: AudioController) {
         self.audio = audio
         guard timer == nil else { return }
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
+        // Common modes keep the meters moving while a slider is dragged or the window resized.
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
     }
     func stop() { timer?.invalidate(); timer = nil }
 
     private func tick() {
-        guard let audio else { return }
+        // Nothing to draw while the Suite is minimized or covered.
+        guard let audio, SuiteWindowController.shared.isOnScreen else { return }
         let peaks = audio.takePeaks()
         var next: [String: Double] = [:]
         let readings = peaks.sources.map { ("src:" + $0.key, $0.value) } + peaks.outputs.map { ("out:" + $0.key, $0.value) }
@@ -245,14 +289,16 @@ struct SuiteView: View {
     @StateObject private var running = RunningApps()
     /// Held without observing: only the meters and wires redraw when levels change, not the whole editor.
     @State private var meters = SuiteMeters()
+    /// Also held without observing: panning and zooming redraw the canvas, not the sidebar.
+    @State private var viewport = SuiteViewport()
 
     var body: some View {
         let catalog = makeCatalog()
         NavigationSplitView {
-            SuiteSidebar(audio: audio, board: board, catalog: catalog)
+            SuiteSidebar(audio: audio, board: board, viewport: viewport, catalog: catalog)
                 .navigationSplitViewColumnWidth(min: 220, ideal: 250, max: 320)
         } detail: {
-            SuiteCanvas(audio: audio, board: board, meters: meters, catalog: catalog)
+            SuiteCanvas(audio: audio, board: board, viewport: viewport, meters: meters, catalog: catalog)
         }
         .onAppear { meters.start(audio) }
         .onDisappear { meters.stop() }
@@ -310,20 +356,34 @@ struct SuiteView: View {
 private struct SuiteSidebar: View {
     @ObservedObject var audio: AudioController
     @ObservedObject var board: SuiteBoard
+    let viewport: SuiteViewport
     let catalog: [SuiteItem]
     @ObservedObject private var virtualMics = VirtualMics.shared
+    @ObservedObject private var navigation = SuiteNavigation.shared
 
     var body: some View {
         // The controls sit below the list rather than over it, so rows never scroll behind them.
         VStack(spacing: 0) {
-            List {
-                section("Apps", kind: .app)
-                section("Inputs", kind: .input)
-                section("Outputs", kind: .output)
-                virtualSection
+            SuiteTabSwitcher(tab: $navigation.tab)
+                .padding(.horizontal, 12).padding(.top, 8).padding(.bottom, 8)
+            // The two pages cross-fade instead of swapping abruptly.
+            ZStack {
+                if navigation.tab == .settings {
+                    SuiteSettings(audio: audio, loginItem: VoidampRuntime.shared.loginItem, updater: VoidampRuntime.shared.updater)
+                        .transition(.opacity)
+                } else {
+                    List {
+                        section("Apps", kind: .app)
+                        section("Inputs", kind: .input)
+                        section("Outputs", kind: .output)
+                        virtualSection
+                    }
+                    .listStyle(.sidebar)
+                    .scrollIndicators(.never)
+                    .transition(.opacity)
+                }
             }
-            .listStyle(.sidebar)
-            .scrollIndicators(.never)
+            .animation(.easeInOut(duration: 0.18), value: navigation.tab)
             controls
         }
     }
@@ -345,7 +405,7 @@ private struct SuiteSidebar: View {
                     if board.placed[item.id] != nil {
                         Button("Remove from Board") { board.remove([item.id], audio: audio, catalog: catalog) }
                     } else {
-                        Button("Add to Board") { board.place(item, at: board.freeSpot(for: item)) }
+                        Button("Add to Board") { board.place(item, at: board.freeSpot(near: viewport.visibleCenter)) }
                     }
                     Divider()
                     Button("Remove Virtual Mics…") { virtualMics.uninstall() }
@@ -362,7 +422,12 @@ private struct SuiteSidebar: View {
                 }
                 .padding(.vertical, 4)
             case .installed where mics.isEmpty:
-                Text("Starting…").font(.system(size: 11)).foregroundStyle(.secondary)
+                // Right after installing the devices take a moment; if they never come, offer to install again.
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(virtualMics.installedAt.map { Date().timeIntervalSince($0) < 20 } ?? false ? "Starting…" : "The virtual mics aren’t running.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    Button("Reinstall…") { virtualMics.install() }.controlSize(.small)
+                }
             case .unavailable:
                 Text("Not included in this build").font(.system(size: 11)).foregroundStyle(.tertiary)
             default:
@@ -396,7 +461,7 @@ private struct SuiteSidebar: View {
             if onBoard {
                 Button("Remove from Board") { board.remove([item.id], audio: audio, catalog: catalog) }
             } else {
-                Button("Add to Board") { board.place(item, at: board.freeSpot(for: item)) }
+                Button("Add to Board") { board.place(item, at: board.freeSpot(near: viewport.visibleCenter)) }
             }
         }
         .help(onBoard ? "\(item.title) is on the board" : "Drag \(item.title) onto the board")
@@ -440,6 +505,7 @@ private struct SuiteSidebar: View {
 private struct SuiteCanvas: View {
     @ObservedObject var audio: AudioController
     @ObservedObject var board: SuiteBoard
+    @ObservedObject var viewport: SuiteViewport
     let meters: SuiteMeters
     let catalog: [SuiteItem]
     @State private var nodeDrag: (id: String, translation: CGSize)?
@@ -457,14 +523,14 @@ private struct SuiteCanvas: View {
             let frames = screenFrames(nodes)
             let wires = makeWires(nodes)
             ZStack(alignment: .topLeading) {
-                SuiteGrid(zoom: board.zoom, pan: board.pan)
+                SuiteGrid(zoom: viewport.zoom, pan: viewport.pan)
                     .contentShape(Rectangle())
                     .gesture(panGesture)
                     .onTapGesture(coordinateSpace: .named("canvas")) { point in
                         selectedWire = hitWire(at: point, wires: wires, frames: frames)
                         selectedNodes = []
                     }
-                SuiteWires(wires: wires, frames: frames, pending: pendingLine(frames), selected: selectedWire, zoom: board.zoom,
+                SuiteWires(wires: wires, frames: frames, pending: pendingLine(frames), selected: selectedWire, zoom: viewport.zoom,
                            paused: !audio.mixingEnabled || !audio.suiteEnabled, meters: meters)
                     .allowsHitTesting(false)
                 ForEach(nodes) { item in
@@ -490,20 +556,21 @@ private struct SuiteCanvas: View {
             .frame(width: geometry.size.width, height: geometry.size.height)
             .clipped()
             .coordinateSpace(name: "canvas")
+            .onChange(of: geometry.size, initial: true) { _, size in viewport.size = size }
             .background(CanvasEvents(onKey: handleKey) { delta, precise, point in
                 if precise {
                     // Trackpad scrolling pans; the mouse wheel zooms.
-                    board.pan.width += delta.width; board.pan.height += delta.height
-                    board.saveView()
+                    viewport.pan.width += delta.width; viewport.pan.height += delta.height
+                    viewport.save()
                 } else if delta.height != 0 {
-                    board.zoom(by: delta.height > 0 ? 1.1 : 1 / 1.1, around: point)
+                    viewport.zoom(by: delta.height > 0 ? 1.1 : 1 / 1.1, around: point)
                 }
             })
             .gesture(MagnifyGesture()
                 .onChanged { value in
-                    let start = magnifyStart ?? board.zoom
+                    let start = magnifyStart ?? viewport.zoom
                     magnifyStart = start
-                    board.zoom(by: start * value.magnification / board.zoom, around: CGPoint(x: geometry.size.width / 2, y: geometry.size.height / 2))
+                    viewport.zoom(by: start * value.magnification / viewport.zoom, around: CGPoint(x: geometry.size.width / 2, y: geometry.size.height / 2))
                 }
                 .onEnded { _ in magnifyStart = nil })
             .dropDestination(for: String.self) { ids, location in
@@ -534,7 +601,7 @@ private struct SuiteCanvas: View {
             Toggle(isOn: $audio.suiteEnabled) {
                 Text("Suite").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
             }
-            .help(audio.suiteEnabled ? "Turn the Suite off: every app plays on the default output and monitoring stops. Your wiring is kept."
+            .help(audio.suiteEnabled ? "Turn the Suite off: wires and microphone monitoring pause, and apps play where they would without Voidamp. Your wiring is kept."
                                      : "Turn the Suite on to use your wiring again")
         }
         .toggleStyle(.switch)
@@ -564,6 +631,12 @@ private struct SuiteCanvas: View {
     private func handleKey(_ event: NSEvent) -> Bool {
         let nodes = catalog.filter { board.placed[$0.id] != nil }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // By the letter typed, so ⌘A is ⌘A on every keyboard layout (key code 0 is Q on AZERTY).
+        if event.charactersIgnoringModifiers?.lowercased() == "a", flags.contains(.command) || flags.contains(.control),
+           flags.isDisjoint(with: [.option, .shift]) {
+            selectedNodes = Set(nodes.map(\.id)); selectedWire = nil
+            return true
+        }
         switch event.keyCode {
         case 51, 117: // Delete, Forward Delete
             if !selectedNodes.isEmpty {
@@ -576,9 +649,6 @@ private struct SuiteCanvas: View {
                 return true
             }
             return false
-        case 0 where flags.contains(.command) || flags.contains(.control): // A
-            selectedNodes = Set(nodes.map(\.id)); selectedWire = nil
-            return true
         case 53: // Escape
             guard !selectedNodes.isEmpty || selectedWire != nil else { return false }
             selectedNodes = []; selectedWire = nil
@@ -609,14 +679,19 @@ private struct SuiteCanvas: View {
     private func zoomControl(size: CGSize) -> some View {
         let center = CGPoint(x: size.width / 2, y: size.height / 2)
         return HStack(spacing: 2) {
-            Button { board.zoom(by: 1 / 1.1, around: center) } label: { Image(systemName: "minus").frame(width: 22, height: 20) }
+            Button { viewport.zoom(by: 1 / 1.1, around: center) } label: { Image(systemName: "minus").frame(width: 22, height: 20) }
                 .help("Zoom out")
-            Button { board.zoom(by: 1 / board.zoom, around: center) } label: {
-                Text("\(Int((board.zoom * 100).rounded()))%").monospacedDigit().frame(width: 44, height: 20)
+            Button { viewport.zoom(by: 1 / viewport.zoom, around: center) } label: {
+                Text("\(Int((viewport.zoom * 100).rounded()))%").monospacedDigit().frame(width: 44, height: 20)
             }
             .help("Actual size")
-            Button { board.zoom(by: 1.1, around: center) } label: { Image(systemName: "plus").frame(width: 22, height: 20) }
+            Button { viewport.zoom(by: 1.1, around: center) } label: { Image(systemName: "plus").frame(width: 22, height: 20) }
                 .help("Zoom in")
+            Divider().frame(height: 14)
+            Button {
+                withAnimation(.easeInOut(duration: 0.25)) { viewport.fit(catalog.compactMap { board.placed[$0.id] }) }
+            } label: { Image(systemName: "arrow.up.left.and.arrow.down.right").frame(width: 22, height: 20) }
+                .help("Show everything on the board")
         }
         .buttonStyle(.plain)
         .font(.system(size: 11, weight: .medium))
@@ -642,14 +717,14 @@ private struct SuiteCanvas: View {
                         .onChanged { nodeDrag = (item.id, $0.translation) }
                         .onEnded { value in
                             if let origin = board.placed[item.id] {
-                                board.move(item.id, to: CGPoint(x: origin.x + value.translation.width / board.zoom,
-                                                                y: origin.y + value.translation.height / board.zoom))
+                                board.move(item.id, to: CGPoint(x: origin.x + value.translation.width / viewport.zoom,
+                                                                y: origin.y + value.translation.height / viewport.zoom))
                             }
                             nodeDrag = nil
                         })
             }
             .contextMenu { contextMenu(item, wires: wires) }
-            .scaleEffect(board.zoom)
+            .scaleEffect(viewport.zoom)
             .position(x: frame.midX, y: frame.midY)
             .overlay {
                 port(item, wires: wires, frame: frame)
@@ -681,7 +756,9 @@ private struct SuiteCanvas: View {
     private func contextMenu(_ item: SuiteItem, wires: [SuiteWire]) -> some View {
         let removable = wires.filter { !$0.implicit && ($0.from == item.id || $0.to == item.id) }
         if !removable.isEmpty {
-            Button(item.kind == .app ? "Back to Default Output" : "Disconnect All") { removable.forEach(disconnect) }
+            // In Patchbay mode an app without wires is silent, so say so.
+            let patchbay = item.kind == .app && audio.patchbayMode && audio.suiteEnabled
+            Button(item.kind != .app ? "Disconnect All" : patchbay ? "Disconnect All (Silences It)" : "Back to Default Output") { removable.forEach(disconnect) }
         }
         if item.kind == .output, let output = audio.sources.first(where: { !$0.input && $0.uid == item.key }), !output.isDefault {
             Button("Use as Default Output") { audio.select(output) }
@@ -700,10 +777,12 @@ private struct SuiteCanvas: View {
 
     // MARK: Geometry
 
+    private func screenFrame(_ id: String) -> CGRect? { board.placed[id].map { viewport.screenFrame(origin: $0) } }
+
     private func screenFrames(_ nodes: [SuiteItem]) -> [String: CGRect] {
         var frames: [String: CGRect] = [:]
         for item in nodes {
-            guard var frame = board.screenFrame(item.id) else { continue }
+            guard var frame = screenFrame(item.id) else { continue }
             if let nodeDrag, nodeDrag.id == item.id { frame = frame.offsetBy(dx: nodeDrag.translation.width, dy: nodeDrag.translation.height) }
             frames[item.id] = frame
         }
@@ -713,11 +792,11 @@ private struct SuiteCanvas: View {
     private var panGesture: some Gesture {
         DragGesture(minimumDistance: 3)
             .onChanged { value in
-                let start = panStart ?? board.pan
+                let start = panStart ?? viewport.pan
                 panStart = start
-                board.pan = CGSize(width: start.width + value.translation.width, height: start.height + value.translation.height)
+                viewport.pan = CGSize(width: start.width + value.translation.width, height: start.height + value.translation.height)
             }
-            .onEnded { _ in panStart = nil; board.saveView() }
+            .onEnded { _ in panStart = nil; viewport.save() }
     }
 
     private func drop(_ ids: [String], at location: CGPoint) -> Bool {
@@ -725,7 +804,7 @@ private struct SuiteCanvas: View {
         var placedAny = false
         for id in ids {
             guard let item = catalog.first(where: { $0.id == id }) else { continue }
-            let center = board.toBoard(location)
+            let center = viewport.toBoard(location)
             board.place(item, at: CGPoint(x: center.x - SuiteMetrics.nodeSize.width / 2 + offset, y: center.y - SuiteMetrics.nodeSize.height / 2 + offset))
             offset += 24
             placedAny = true
@@ -800,7 +879,7 @@ private struct SuiteCanvas: View {
     /// The node under the pointer that a wire from `item` can end on: anywhere on a node of the other side.
     private func target(at point: CGPoint, from item: SuiteItem) -> String? {
         let nodes = catalog.filter { board.placed[$0.id] != nil && $0.isSource != item.isSource }
-        return nodes.first { board.screenFrame($0.id)?.insetBy(dx: -14, dy: -6).contains(point) ?? false }?.id
+        return nodes.first { screenFrame($0.id)?.insetBy(dx: -14, dy: -6).contains(point) ?? false }?.id
     }
 
     private func pendingLine(_ frames: [String: CGRect]) -> (CGPoint, CGPoint)? {
@@ -831,7 +910,7 @@ private struct SuiteCanvas: View {
     private func hitWire(at point: CGPoint, wires: [SuiteWire], frames: [String: CGRect]) -> String? {
         wires.reversed().first { wire in
             guard !wire.implicit, let from = frames[wire.from], let to = frames[wire.to] else { return false }
-            return SuiteWires.path(from: SuiteWires.start(from), to: SuiteWires.end(to), zoom: board.zoom)
+            return SuiteWires.path(from: SuiteWires.start(from), to: SuiteWires.end(to), zoom: viewport.zoom)
                 .strokedPath(StrokeStyle(lineWidth: 14, lineCap: .round)).contains(point)
         }?.id
     }
@@ -1027,10 +1106,13 @@ private struct SuiteNodeSurface: ViewModifier {
 }
 
 /// A thin level meter that reddens near clipping.
+/// It alone observes the meters, so the 30 updates a second redraw the bar and not the node around it.
 private struct SuiteMeter: View {
-    let level: Double
+    @ObservedObject var meters: SuiteMeters
+    let key: String
     let live: Bool
     var body: some View {
+        let level = meters.levels[key] ?? 0
         GeometryReader { geometry in
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.primary.opacity(0.08))
@@ -1064,14 +1146,14 @@ private struct SuiteNodeHeader: View {
 private struct SuiteAppNode: View {
     @ObservedObject var audio: AudioController
     let app: AppSource
-    @ObservedObject var meters: SuiteMeters
+    let meters: SuiteMeters
     let wires: [SuiteWire]
     @State private var dragging = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             SuiteNodeHeader(icon: AnyView(icon), title: app.name, status: status, statusColor: audio.routeFailures[app.id] == nil ? .secondary : .orange)
-            SuiteMeter(level: meters.levels["src:" + app.id] ?? 0, live: audio.isRouted(app.id))
+            SuiteMeter(meters: meters, key: "src:" + app.id, live: audio.isRouted(app.id))
             HStack(spacing: 8) {
                 Slider(value: Binding(get: { app.gain }, set: { audio.setAppGain(app, $0, snapping: dragging) }), in: 0...2,
                        onEditingChanged: { dragging = $0 })
@@ -1116,13 +1198,13 @@ private struct SuiteAppNode: View {
 private struct SuiteInputNode: View {
     @ObservedObject var audio: AudioController
     let input: AudioSource
-    @ObservedObject var meters: SuiteMeters
+    let meters: SuiteMeters
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             SuiteNodeHeader(icon: AnyView(Image(systemName: "mic.fill").font(.system(size: 15)).foregroundStyle(.secondary)),
                             title: audio.displayName(input), status: status, statusColor: statusColor)
-            SuiteMeter(level: meters.levels["src:" + input.uid] ?? 0, live: audio.isRouted(input.uid))
+            SuiteMeter(meters: meters, key: "src:" + input.uid, live: audio.isRouted(input.uid))
             HStack(spacing: 8) {
                 Slider(value: Binding(get: { audio.monitorGain(input) }, set: { audio.setMonitorGain(input, MixerGain.adjusted($0, snapping: true)) }), in: 0...2)
                     .controlSize(.small)
@@ -1159,14 +1241,14 @@ private struct SuiteInputNode: View {
 private struct SuiteOutputNode: View {
     @ObservedObject var audio: AudioController
     let output: AudioSource
-    @ObservedObject var meters: SuiteMeters
+    let meters: SuiteMeters
     let symbol: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             SuiteNodeHeader(icon: AnyView(Image(systemName: symbol).font(.system(size: 15)).foregroundStyle(output.isDefault ? Color.accentColor : .secondary)),
                             title: audio.displayName(output), status: status)
-            SuiteMeter(level: meters.levels["out:" + output.uid] ?? 0, live: true)
+            SuiteMeter(meters: meters, key: "out:" + output.uid, live: true)
             HStack(spacing: 8) {
                 if output.channels.isEmpty {
                     Text("Volume is set on the device").font(.system(size: 11)).foregroundStyle(.tertiary)
@@ -1252,13 +1334,13 @@ private struct SuiteSyncButton: View {
 private struct SuiteVirtualMicNode: View {
     @ObservedObject var audio: AudioController
     let output: AudioSource
-    @ObservedObject var meters: SuiteMeters
+    let meters: SuiteMeters
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             SuiteNodeHeader(icon: AnyView(Image(systemName: "waveform.and.mic").font(.system(size: 15)).foregroundStyle(Color.accentColor)),
                             title: audio.displayName(output), status: status)
-            SuiteMeter(level: meters.levels["out:" + output.uid] ?? 0, live: true)
+            SuiteMeter(meters: meters, key: "out:" + output.uid, live: true)
             Text(hint).font(.system(size: 11)).foregroundStyle(.tertiary).lineLimit(1)
         }
         .padding(.horizontal, 14).padding(.vertical, 12)

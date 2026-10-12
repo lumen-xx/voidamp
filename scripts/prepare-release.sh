@@ -20,6 +20,18 @@ rm -f "$RELEASE_DIR/appcast.xml"
 if gh release view --repo "$REPOSITORY" >/dev/null 2>&1; then
     gh release download --repo "$REPOSITORY" --pattern appcast.xml --dir "$RELEASE_DIR" --clobber
 fi
+# Sparkle only offers a higher build number, and the bundle must say the version being released.
+python3 - "$RELEASE_DIR/appcast.xml" "$BUILD" "$VERSION" dist/Voidamp.app/Contents/Info.plist <<'PYCHECK'
+import pathlib, plistlib, sys, xml.etree.ElementTree as ET
+feed, build, version, info = sys.argv[1], int(sys.argv[2]), sys.argv[3], plistlib.loads(pathlib.Path(sys.argv[4]).read_bytes())
+if pathlib.Path(feed).exists():
+    namespace = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
+    published = [int(item.findtext(namespace + "version")) for item in ET.parse(feed).getroot().findall("./channel/item")]
+    if published and build <= max(published):
+        raise SystemExit(f"Build {build} must be higher than the latest published build {max(published)}.")
+if info["CFBundleShortVersionString"] != version or info["CFBundleVersion"] != str(build):
+    raise SystemExit("The built app's version or build doesn't match this release.")
+PYCHECK
 ditto -c -k --sequesterRsrc --keepParent dist/Voidamp.app "$RELEASE_DIR/Voidamp-$VERSION.zip"
 .build/artifacts/sparkle/Sparkle/bin/generate_appcast \
     --account app.voidamp.mac.updates \

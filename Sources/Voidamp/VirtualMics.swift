@@ -11,6 +11,8 @@ final class VirtualMics: ObservableObject {
 
     enum State: Equatable { case unavailable, notInstalled, outdated, installed }
     @Published private(set) var state = State.unavailable
+    /// When Voidamp last installed the driver: the devices take a moment to appear afterwards.
+    @Published private(set) var installedAt: Date?
 
     private var bundled: URL? { Bundle.main.url(forResource: "VoidampMic", withExtension: "driver") }
 
@@ -46,11 +48,19 @@ final class VirtualMics: ObservableObject {
         alert.addButton(withTitle: "Cancel")
         NSApplication.shared.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let target = Self.installed.path
+        // Copied beside the old driver first and checked, then swapped in, so a failed copy never leaves the audio
+        // system without a driver or with a damaged one. The copy's name doesn't end in .driver, so Core Audio
+        // ignores it until it is moved into place.
+        let target = quoted(Self.installed.path)
+        let staged = quoted(Self.installed.deletingLastPathComponent().appendingPathComponent(".VoidampMic.driver.new").path)
+        let previous = quoted(Self.installed.deletingLastPathComponent().appendingPathComponent(".VoidampMic.driver.old").path)
         run("""
-            mkdir -p /Library/Audio/Plug-Ins/HAL && rm -rf \(quoted(target)) && cp -R \(quoted(bundled.path)) \(quoted(target)) \
-            && chown -R root:wheel \(quoted(target)) && (xattr -dr com.apple.quarantine \(quoted(target)) || true) && killall coreaudiod
+            set -e; mkdir -p /Library/Audio/Plug-Ins/HAL; rm -rf \(staged) \(previous); cp -R \(quoted(bundled.path)) \(staged); \
+            codesign --verify --strict -R='identifier "app.voidamp.mic"' \(staged); chown -R root:wheel \(staged); \
+            xattr -dr com.apple.quarantine \(staged) || true; if [ -e \(target) ]; then mv \(target) \(previous); fi; \
+            if mv \(staged) \(target); then rm -rf \(previous); else mv \(previous) \(target); exit 1; fi; killall coreaudiod || true
             """, prompt: "Voidamp wants to add its virtual microphones.")
+        installedAt = Date()
     }
 
     func uninstall() {
@@ -61,7 +71,9 @@ final class VirtualMics: ObservableObject {
         alert.addButton(withTitle: "Cancel")
         NSApplication.shared.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        run("rm -rf \(quoted(Self.installed.path)) && killall coreaudiod", prompt: "Voidamp wants to remove its virtual microphones.")
+        // Wires into the virtual mics go too; otherwise an app sent only to a call would fall back to the speakers.
+        for index in 1...2 { VoidampRuntime.shared.audio.clearWiring(output: Self.uidPrefix + String(index)) }
+        run("rm -rf \(quoted(Self.installed.path)) && (killall coreaudiod || true)", prompt: "Voidamp wants to remove its virtual microphones.")
     }
 
     /// Runs a shell command as administrator through macOS's own password prompt.

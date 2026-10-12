@@ -11,6 +11,12 @@ SECRET_DIR="$HOME/.config/voidamp"
 PASSWORD_FILE="$SECRET_DIR/signing-password"
 
 if [ ! -f "$KEYCHAIN" ]; then
+    # A new identity breaks permissions for everyone who updates; only create one on purpose.
+    if [ "${VOIDAMP_NEW_SIGNING_IDENTITY:-}" != "1" ]; then
+        echo "The Voidamp signing keychain is missing: $KEYCHAIN" >&2
+        echo "Restore it from the backup. To create a new identity anyway, set VOIDAMP_NEW_SIGNING_IDENTITY=1." >&2
+        exit 1
+    fi
     mkdir -p "$SECRET_DIR"
     chmod 700 "$SECRET_DIR"
     if [ ! -f "$PASSWORD_FILE" ]; then

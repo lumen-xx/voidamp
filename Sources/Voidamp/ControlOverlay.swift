@@ -20,6 +20,13 @@ final class ControlOverlay {
     private let model = OverlayModel()
     private lazy var window = OverlayWindow(model: model)
     private var hideWork: DispatchWorkItem?
+    /// Watches the pointer while the card is up. The card lets clicks through to the window underneath until the
+    /// pointer has moved onto it and rested briefly, so a click on a browser tab under it never sets the volume.
+    private var hoverTimer: Timer?
+    private var restingSince: Date?
+    private var pointerAtShow = NSPoint.zero
+    /// Keys whose press was handled, so their release is swallowed too and the two always agree.
+    fileprivate var swallowedKeys: Set<Int32> = []
 
     var enabled: Bool {
         get { UserDefaults.standard.object(forKey: Self.enabledKey) as? Bool ?? true }
@@ -51,6 +58,11 @@ final class ControlOverlay {
             let firstTime = !UserDefaults.standard.bool(forKey: Self.promptedKey)
             if prompt || firstTime {
                 UserDefaults.standard.set(true, forKey: Self.promptedKey)
+                // The first time, say why before macOS asks; "Not Now" turns the overlay off instead.
+                if firstTime && !prompt && !explainAccessibility() {
+                    UserDefaults.standard.set(false, forKey: Self.enabledKey)
+                    return
+                }
                 _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
             }
             trustTimer?.invalidate()
@@ -70,6 +82,16 @@ final class ControlOverlay {
         source = CFMachPortCreateRunLoopSource(nil, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    private func explainAccessibility() -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Use Voidamp for the volume and brightness keys?"
+        alert.informativeText = "Voidamp can show its own card when you change the volume or brightness. macOS asks you to allow Accessibility so Voidamp can see those keys; it doesn’t see anything you type. You can change this later in Voidamp’s Settings."
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Not Now")
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     func stop() {
@@ -94,12 +116,13 @@ final class ControlOverlay {
             if key == NX_KEYTYPE_MUTE {
                 audio.toggleSoundMute()
             } else {
-                if audio.soundMuted { audio.toggleSoundMute() }
+                // However it was muted, turning the volume up or down should be heard.
+                audio.unmuteSound()
                 let current = audio.displayVolume(output)
                 audio.setVolume(output, Self.step(current, up: key == NX_KEYTYPE_SOUND_UP, steps: steps))
             }
             let live = audio.sources.first(where: { $0.id == output.id }) ?? output
-            show(.volume, level: audio.displayVolume(live), muted: audio.soundMuted, title: audio.displayName(live))
+            show(.volume, level: audio.displayVolume(live), muted: soundIsMuted, title: audio.displayName(live))
             return true
         case NX_KEYTYPE_BRIGHTNESS_UP, NX_KEYTYPE_BRIGHTNESS_DOWN:
             guard let current = DisplayBrightness.level() else { return false }
@@ -110,6 +133,11 @@ final class ControlOverlay {
         default:
             return false
         }
+    }
+
+    /// Muted by Voidamp or by the output's own mute switch.
+    private var soundIsMuted: Bool {
+        audio.soundMuted || (audio.sources.first(where: { !$0.input && $0.isDefault })?.hardwareMuted ?? false)
     }
 
     /// Moves to the next step on the grid, like the system: 16 steps, or 64 with Option-Shift.
@@ -124,8 +152,14 @@ final class ControlOverlay {
         guard !panelShown() else { return }
         window.placeCentred()
         if !window.isVisible || window.alphaValue < 1 {
+            if !window.isVisible {
+                window.ignoresMouseEvents = true
+                pointerAtShow = NSEvent.mouseLocation
+                restingSince = nil
+            }
             window.alphaValue = window.isVisible ? window.alphaValue : 0
             window.orderFrontRegardless()
+            watchPointer()
             NSAnimationContext.runAnimationGroup { $0.duration = 0.15; window.animator().alphaValue = 1 }
         }
         scheduleHide()
@@ -145,13 +179,50 @@ final class ControlOverlay {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.4, execute: work)
     }
 
+    private func watchPointer() {
+        guard hoverTimer == nil else { return }
+        hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pointerTick() }
+        }
+        RunLoop.main.add(hoverTimer!, forMode: .common)
+    }
+
+    private func pointerTick() {
+        guard window.isVisible else {
+            hoverTimer?.invalidate(); hoverTimer = nil
+            window.ignoresMouseEvents = true
+            model.dragging = false
+            model.hovering = false
+            return
+        }
+        // A drag SwiftUI cancelled without ending: the button is up, so show the pointer again.
+        if model.dragging, NSEvent.pressedMouseButtons == 0 { model.dragging = false }
+        let pointer = NSEvent.mouseLocation
+        let card = window.frame.insetBy(dx: 20, dy: 20)
+        // A pointer that was already resting where the card appeared doesn't count until it moves.
+        guard NSMouseInRect(pointer, card, false), pointer != pointerAtShow else {
+            restingSince = nil
+            if !model.dragging {
+                window.ignoresMouseEvents = true
+                model.hovering = false
+            }
+            return
+        }
+        let since = restingSince ?? Date()
+        restingSince = since
+        if Date().timeIntervalSince(since) >= 0.25 {
+            window.ignoresMouseEvents = false
+            model.hovering = true
+        }
+    }
+
     /// Sets the level from the card, when it is dragged or clicked.
     private func apply(level: Double) {
         let level = min(1, max(0, level))
         switch model.kind {
         case .volume:
             guard let output = audio.sources.first(where: { !$0.input && $0.isDefault }), !output.channels.isEmpty else { return }
-            if audio.soundMuted { audio.toggleSoundMute() }
+            audio.unmuteSound()
             audio.setVolume(output, level)
             model.level = level; model.muted = false
         case .brightness:
@@ -162,7 +233,7 @@ final class ControlOverlay {
     private func toggleMute() {
         guard model.kind == .volume else { return }
         audio.toggleSoundMute()
-        model.muted = audio.soundMuted
+        model.muted = soundIsMuted
     }
 }
 
@@ -180,12 +251,17 @@ private func overlayTapCallback(proxy: CGEventTapProxy, type: CGEventType, event
     let down = ((system.data1 & 0x0000FF00) >> 8) == 0xA
     guard [NX_KEYTYPE_SOUND_UP, NX_KEYTYPE_SOUND_DOWN, NX_KEYTYPE_MUTE, NX_KEYTYPE_BRIGHTNESS_UP, NX_KEYTYPE_BRIGHTNESS_DOWN].contains(key) else { return Unmanaged.passUnretained(event) }
     let flags = system.modifierFlags.intersection(.deviceIndependentFlagsMask)
-    // The event tap runs on the main run loop, so the overlay can be used directly.
-    let handled = MainActor.assumeIsolated { overlay.wouldHandle(key: key, flags: flags) }
-    guard handled else { return Unmanaged.passUnretained(event) }
-    if down { MainActor.assumeIsolated { _ = overlay.handle(key: key, flags: flags) } }
-    // Swallow both the press and the release so macOS shows nothing.
-    return nil
+    // The event tap runs on the main run loop, so the overlay can be used directly. A press is swallowed only when
+    // Voidamp applied it; its release follows the press, so macOS never sees half a key.
+    let swallow = MainActor.assumeIsolated { () -> Bool in
+        if down {
+            let handled = overlay.wouldHandle(key: key, flags: flags) && overlay.handle(key: key, flags: flags)
+            if handled { overlay.swallowedKeys.insert(key) } else { overlay.swallowedKeys.remove(key) }
+            return handled
+        }
+        return overlay.swallowedKeys.remove(key) != nil
+    }
+    return swallow ? nil : Unmanaged.passUnretained(event)
 }
 
 extension ControlOverlay {
@@ -196,7 +272,8 @@ extension ControlOverlay {
         case NX_KEYTYPE_SOUND_UP, NX_KEYTYPE_SOUND_DOWN, NX_KEYTYPE_MUTE:
             return audio.sources.first(where: { !$0.input && $0.isDefault }).map { !$0.channels.isEmpty } ?? false
         case NX_KEYTYPE_BRIGHTNESS_UP, NX_KEYTYPE_BRIGHTNESS_DOWN:
-            return DisplayBrightness.level() != nil
+            // Only the built-in display, and only with the pointer on it; other displays are macOS's to handle.
+            return DisplayBrightness.level() != nil && DisplayBrightness.pointerOnBuiltIn
         default:
             return false
         }
@@ -243,6 +320,12 @@ enum DisplayBrightness {
         var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
         guard CGGetOnlineDisplayList(count, &displays, &count) == .success else { return nil }
         return displays.first { CGDisplayIsBuiltin($0) != 0 && CGDisplayIsActive($0) != 0 }
+    }
+    /// Whether the pointer is on the built-in display, which the brightness keys then belong to.
+    static var pointerOnBuiltIn: Bool {
+        let mouse = NSEvent.mouseLocation
+        guard let builtIn, let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) else { return false }
+        return (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == builtIn
     }
     static var name: String {
         NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == builtIn }?.localizedName ?? "Built-in Display"
@@ -300,11 +383,11 @@ final class OverlayWindow: NSPanel {
         backgroundColor = .clear
         hasShadow = false
         level = .popUpMenu
-        acceptsMouseMovedEvents = true
+        // Clicks pass through until the pointer rests on the card; ControlOverlay switches this.
+        ignoresMouseEvents = true
         collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         isReleasedWhenClosed = false
         let host = OverlayHostingView(rootView: OverlayCard(model: model).padding(20))
-        host.model = model
         host.frame = contentRect(forFrameRect: frame)
         contentView = host
     }
@@ -323,40 +406,15 @@ final class OverlayWindow: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-/// Tracks the pointer over the card, even while another app is active. Hover starts on movement, so a pointer that
-/// was already resting where the card appears does not keep it up.
+/// Takes the first click without activating Voidamp, once the card accepts clicks at all.
 private final class OverlayHostingView<Content: View>: NSHostingView<Content> {
-    weak var model: OverlayModel?
-    private var area: NSTrackingArea?
-    private var card: NSRect { bounds.insetBy(dx: 20, dy: 20) }
-
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let area { removeTrackingArea(area) }
-        let area = NSTrackingArea(rect: card, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways], owner: self)
-        addTrackingArea(area)
-        self.area = area
-    }
-    override func mouseMoved(with event: NSEvent) {
-        super.mouseMoved(with: event)
-        if card.contains(convert(event.locationInWindow, from: nil)) { model?.hovering = true }
-    }
-    override func mouseExited(with event: NSEvent) {
-        super.mouseExited(with: event)
-        model?.hovering = false
-    }
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        // A hidden card cannot be hovered.
-        if window == nil { model?.hovering = false }
-    }
 }
 
 /// The card: a small icon, a thick level bar and a large icon on a rounded glass pill. With the pointer on it, the bar
 /// can be dragged or clicked and the card stays up; clicking the speaker mutes.
 struct OverlayCard: View {
-    static let size = CGSize(width: 296, height: 48)
+    static let size = CGSize(width: 240, height: 48)
     @ObservedObject var model: OverlayModel
     @Environment(\.colorScheme) private var scheme
     /// One fixed ink per appearance. Liquid Glass adapts semantic colours to whatever is behind the card, which

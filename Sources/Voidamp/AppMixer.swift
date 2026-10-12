@@ -97,7 +97,8 @@ final class AppRoute {
         outputUID = uid
         self.gain.withLock { $0 = Float(gain) }
         sampleRate = HAL.read(output, kAudioDevicePropertyNominalSampleRate, initial: Float64(0)).flatMap { $0 > 0 ? $0 : nil } ?? 48_000
-        delayLine = DelayLine(capacity: Int(sampleRate))
+        // Three seconds covers AirPlay, the slowest outputs.
+        delayLine = DelayLine(capacity: Int(sampleRate * 3))
         do {
             let description = CATapDescription(stereoMixdownOfProcesses: processes)
             description.name = "Voidamp app audio"
@@ -144,7 +145,7 @@ final class AppRoute {
                 let multiplier = gainState.withLock { $0 }
                 var loudest: Float = 0
                 var channelOffset = 0
-                let delayFrames = delay.frames
+                let (fromDelay, toDelay) = delay.beginBlock()
                 var blockFrames = 0
                 for buffer in outputs {
                     guard let destination = buffer.mData else { continue }
@@ -171,14 +172,14 @@ final class AppRoute {
                             let sample: Float = frame < frames ? samples[frame * sourceChannels + (planar ? 0 : sourceChannel)] * multiplier : 0
                             let clipped = min(1, max(-1, sample))
                             // Held back to line up with a slower output playing the same app.
-                            let played = delayFrames > 0 ? delay.pass(clipped, channel: sourceChannel, frame: frame, delay: delayFrames) : clipped
+                            let played = delay.pass(clipped, channel: sourceChannel, frame: frame, frames: outputFrames, from: fromDelay, to: toDelay)
                             result[frame * channels + channel] = played
                             loudest = max(loudest, abs(played))
                         }
                     }
                     channelOffset += channels
                 }
-                delay.advance(by: blockFrames)
+                delay.endBlock(frames: blockFrames, delay: toDelay)
                 let blockPeak = loudest
                 peakState.withLock { $0 = max($0, blockPeak) }
             }, "Starting the app mixer")
@@ -220,36 +221,48 @@ final class AppRoute {
     }
 }
 
-/// A per-channel ring buffer that delays audio by a whole number of frames, up to its capacity. The delay is set
-/// from the main thread; the samples are only touched by the audio thread.
+/// A stereo ring buffer that delays audio by a whole number of frames, up to its capacity. The target delay is set
+/// from the main thread; samples and the delay in effect are only touched by the audio thread. It always records,
+/// so switching a delay on never plays stale audio, and a change crossfades over one buffer instead of clicking.
 final class DelayLine: @unchecked Sendable {
-    static let channels = 8
+    static let channels = 2
     private let capacity: Int
     private let buffer: UnsafeMutablePointer<Float>
     private var position = 0
-    private let delay = OSAllocatedUnfairLock(initialState: 0)
+    private var current = 0
+    private let target = OSAllocatedUnfairLock(initialState: 0)
 
     init(capacity: Int) {
-        self.capacity = max(1, capacity)
+        self.capacity = max(2, capacity)
         buffer = .allocate(capacity: self.capacity * Self.channels)
         buffer.initialize(repeating: 0, count: self.capacity * Self.channels)
     }
     deinit { buffer.deallocate() }
 
     var frames: Int {
-        get { delay.withLock { $0 } }
-        set { delay.withLock { $0 = min(capacity - 1, max(0, newValue)) } }
+        get { target.withLock { $0 } }
+        set { target.withLock { $0 = min(capacity - 1, max(0, newValue)) } }
     }
 
-    /// Stores `sample` and returns the one from `delay` frames earlier. Channels beyond the buffer pass straight through.
-    func pass(_ sample: Float, channel: Int, frame: Int, delay: Int) -> Float {
+    /// The delay in effect and the one to move to during this buffer.
+    func beginBlock() -> (Int, Int) { (current, frames) }
+
+    /// Stores `sample` and returns the delayed one, blending from the old delay to the new across the buffer.
+    /// Channels beyond stereo pass straight through; the taps are stereo, so they carry silence.
+    func pass(_ sample: Float, channel: Int, frame: Int, frames: Int, from: Int, to: Int) -> Float {
         guard channel < Self.channels else { return sample }
         let write = (position + frame) % capacity
-        let read = (write - delay + capacity) % capacity
         buffer[write * Self.channels + channel] = sample
-        return buffer[read * Self.channels + channel]
+        let new = buffer[((write - to + capacity) % capacity) * Self.channels + channel]
+        guard from != to, frames > 1 else { return new }
+        let old = buffer[((write - from + capacity) % capacity) * Self.channels + channel]
+        let progress = Float(frame) / Float(frames - 1)
+        return old + (new - old) * progress
     }
-    func advance(by frames: Int) { position = (position + frames) % capacity }
+    func endBlock(frames: Int, delay: Int) {
+        position = (position + frames) % capacity
+        current = delay
+    }
 }
 
 /// Plays a microphone or other input on an output, for monitoring. Both devices join one private aggregate; the

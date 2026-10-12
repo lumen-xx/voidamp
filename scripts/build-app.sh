@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VERSION="${VOIDAMP_VERSION:-1.1.29}"
-BUILD="${VOIDAMP_BUILD:-31}"
+VERSION="${VOIDAMP_VERSION:-1.1.30}"
+BUILD="${VOIDAMP_BUILD:-32}"
 APP="$(pwd)/dist/Voidamp.app"
 swift build -c release
 BIN_PATH="$(swift build -c release --show-bin-path)"
@@ -52,8 +52,12 @@ UPDATE_REPOSITORY="$(cat updates/repository.txt)"
 bash scripts/build-driver.sh "$APP/Contents/Resources"
 SIGNING_KEYCHAIN="$(bash scripts/signing-identity.sh)"
 codesign --force --keychain "$SIGNING_KEYCHAIN" --sign "Voidamp Local Signing" "$APP"
-if ! codesign -d --requirements - "$APP" 2>&1 | grep -q "certificate leaf"; then
-    echo "Voidamp was not signed with the stable identity." >&2
+# The certificate must be the one every installed copy was signed with; a new one would make every user allow
+# audio recording and Accessibility again. updates/signing-certificate.txt holds its fingerprint.
+EXPECTED_LEAF="$(cat updates/signing-certificate.txt)"
+if ! codesign -d --requirements - "$APP" 2>&1 | grep -q "certificate leaf = H\"$EXPECTED_LEAF\""; then
+    echo "Voidamp was not signed with the expected certificate ($EXPECTED_LEAF)." >&2
+    echo "Restore ~/Library/Keychains/voidamp-signing.keychain-db and ~/.config/voidamp/signing-password from the backup." >&2
     exit 1
 fi
 codesign --verify --deep --strict "$APP"
