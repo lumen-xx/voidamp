@@ -78,6 +78,9 @@ final class AppRoute {
     private let gain = OSAllocatedUnfairLock(initialState: Float(1))
     private let callbacks = OSAllocatedUnfairLock(initialState: UInt64(0))
     private let peak = OSAllocatedUnfairLock(initialState: Float(0))
+    private let delayLine: DelayLine
+    /// The output's sample rate, for converting delays to frames.
+    let sampleRate: Double
     let createdAt = Date()
     var callbackCount: UInt64 { callbacks.withLock { $0 } }
     let processes: [AudioObjectID]
@@ -93,6 +96,8 @@ final class AppRoute {
         guard let uid = HAL.string(output, kAudioDevicePropertyDeviceUID) else { throw RoutingError(message: "No output device is available.") }
         outputUID = uid
         self.gain.withLock { $0 = Float(gain) }
+        sampleRate = HAL.read(output, kAudioDevicePropertyNominalSampleRate, initial: Float64(0)).flatMap { $0 > 0 ? $0 : nil } ?? 48_000
+        delayLine = DelayLine(capacity: Int(sampleRate))
         do {
             let description = mixdown ? CATapDescription(stereoMixdownOfProcesses: processes) : CATapDescription(processes: processes, deviceUID: uid, stream: 0)
             description.name = "Voidamp app audio"
@@ -124,6 +129,7 @@ final class AppRoute {
             let gainState = self.gain
             let callbackState = self.callbacks
             let peakState = self.peak
+            let delay = self.delayLine
             try check(AudioDeviceCreateIOProcIDWithBlock(&io, aggregate, nil) { _, input, _, output, _ in
                 let inputs = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
                 let outputs = UnsafeMutableAudioBufferListPointer(output)
@@ -138,12 +144,15 @@ final class AppRoute {
                 let multiplier = gainState.withLock { $0 }
                 var loudest: Float = 0
                 var channelOffset = 0
+                let delayFrames = delay.frames
+                var blockFrames = 0
                 for buffer in outputs {
                     guard let destination = buffer.mData else { continue }
                     let result = destination.assumingMemoryBound(to: Float.self)
                     let channels = Int(buffer.mNumberChannels)
                     guard channels > 0 else { continue }
                     let outputFrames = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size / channels
+                    blockFrames = outputFrames
                     for channel in 0..<channels {
                         let sourceChannel = channelOffset + channel
                         if sourceChannel >= tapChannels {
@@ -161,12 +170,15 @@ final class AppRoute {
                         for frame in 0..<outputFrames {
                             let sample: Float = frame < frames ? samples[frame * sourceChannels + (planar ? 0 : sourceChannel)] * multiplier : 0
                             let clipped = min(1, max(-1, sample))
-                            result[frame * channels + channel] = clipped
-                            loudest = max(loudest, abs(clipped))
+                            // Held back to line up with a slower output playing the same app.
+                            let played = delayFrames > 0 ? delay.pass(clipped, channel: sourceChannel, frame: frame, delay: delayFrames) : clipped
+                            result[frame * channels + channel] = played
+                            loudest = max(loudest, abs(played))
                         }
                     }
                     channelOffset += channels
                 }
+                delay.advance(by: blockFrames)
                 let blockPeak = loudest
                 peakState.withLock { $0 = max($0, blockPeak) }
             }, "Starting the app mixer")
@@ -188,6 +200,9 @@ final class AppRoute {
     }
 
     func setGain(_ value: Double) { gain.withLock { $0 = Float(value) } }
+    /// Delays this route's audio, so outputs that play the same app stay in sync.
+    func setDelay(seconds: Double) { delayLine.frames = Int((max(0, seconds) * sampleRate).rounded()) }
+    var delaySeconds: Double { Double(delayLine.frames) / sampleRate }
     /// The loudest sample played since the last call, for level meters.
     func takePeak() -> Float { peak.withLock { let value = $0; $0 = 0; return value } }
     func stop() {
@@ -203,6 +218,38 @@ final class AppRoute {
     private func check(_ status: OSStatus, _ operation: String) throws {
         if status != noErr { throw RoutingError(message: "\(operation) failed (\(status)).") }
     }
+}
+
+/// A per-channel ring buffer that delays audio by a whole number of frames, up to its capacity. The delay is set
+/// from the main thread; the samples are only touched by the audio thread.
+final class DelayLine: @unchecked Sendable {
+    static let channels = 8
+    private let capacity: Int
+    private let buffer: UnsafeMutablePointer<Float>
+    private var position = 0
+    private let delay = OSAllocatedUnfairLock(initialState: 0)
+
+    init(capacity: Int) {
+        self.capacity = max(1, capacity)
+        buffer = .allocate(capacity: self.capacity * Self.channels)
+        buffer.initialize(repeating: 0, count: self.capacity * Self.channels)
+    }
+    deinit { buffer.deallocate() }
+
+    var frames: Int {
+        get { delay.withLock { $0 } }
+        set { delay.withLock { $0 = min(capacity - 1, max(0, newValue)) } }
+    }
+
+    /// Stores `sample` and returns the one from `delay` frames earlier. Channels beyond the buffer pass straight through.
+    func pass(_ sample: Float, channel: Int, frame: Int, delay: Int) -> Float {
+        guard channel < Self.channels else { return sample }
+        let write = (position + frame) % capacity
+        let read = (write - delay + capacity) % capacity
+        buffer[write * Self.channels + channel] = sample
+        return buffer[read * Self.channels + channel]
+    }
+    func advance(by frames: Int) { position = (position + frames) % capacity }
 }
 
 /// Plays a microphone or other input on an output, for monitoring. Both devices join one private aggregate; the

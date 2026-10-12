@@ -68,8 +68,10 @@ struct SuiteItem: Identifiable, Equatable {
 struct SuiteWire: Identifiable, Equatable {
     let from: String
     let to: String
-    /// The implicit wire of an unconnected app to the default output; it can't be removed.
+    /// The implicit wire of an unconnected app to where it plays anyway; it can't be removed.
     let implicit: Bool
+    /// Says why an implicit wire goes where it does: "default" or "app’s choice".
+    var label: String? = nil
     var id: String { "\(from)→\(to)" }
 }
 
@@ -627,6 +629,20 @@ private struct SuiteCanvas: View {
         if item.kind == .output, let output = audio.sources.first(where: { !$0.input && $0.uid == item.key }), !output.isDefault {
             Button("Use as Default Output") { audio.select(output) }
         }
+        if item.kind == .output, let output = audio.sources.first(where: { !$0.input && $0.uid == item.key }) {
+            // Reported latencies are estimates, Bluetooth especially; this nudges one output when outputs drift apart.
+            Menu("Sync Offset") {
+                ForEach([-100.0, -50, -25, 0, 25, 50, 100, 150, 200], id: \.self) { value in
+                    Button {
+                        audio.setSyncOffset(output, milliseconds: value)
+                    } label: {
+                        let name = value == 0 ? "None" : "\(value > 0 ? "+" : "−")\(Int(abs(value))) ms"
+                        if audio.syncOffset(output) == value { Label(name, systemImage: "checkmark") } else { Text(name) }
+                    }
+                }
+            }
+            .help("If this output sounds early or late next to another, add or remove delay")
+        }
         if item.kind == .input, let input = audio.sources.first(where: { $0.input && $0.uid == item.key }), !input.isDefault {
             Button("Use as Default Microphone") { audio.select(input) }
         }
@@ -684,9 +700,12 @@ private struct SuiteCanvas: View {
             let app = audio.appSource(id: item.key, name: item.title, icon: item.icon)
             let wired = audio.wiredOutputs(app).filter { uid in outputs.contains { $0.uid == uid } }
             if app.isSystem, let alert = wired.first {
-                wires.append(SuiteWire(from: item.id, to: "out:" + alert, implicit: alert == defaultOutput?.uid))
-            } else if wired.isEmpty, let defaultOutput {
-                wires.append(SuiteWire(from: item.id, to: "out:" + defaultOutput.uid, implicit: true))
+                let onDefault = alert == defaultOutput?.uid
+                wires.append(SuiteWire(from: item.id, to: "out:" + alert, implicit: onDefault, label: onDefault ? "default" : nil))
+            } else if wired.isEmpty, let target = audio.unwiredOutput(app) {
+                // Unwired apps play where they would anyway: their own output setting, or the default output.
+                let label = target.uid == defaultOutput?.uid ? "default" : "app’s choice"
+                wires.append(SuiteWire(from: item.id, to: "out:" + target.uid, implicit: true, label: label))
             } else {
                 wires += wired.map { SuiteWire(from: item.id, to: "out:" + $0, implicit: false) }
             }
@@ -854,6 +873,17 @@ private struct SuiteWires: View {
                 let level = meters.levels["src:" + key] ?? 0
                 if wire.implicit || paused {
                     context.stroke(path, with: .color(.secondary.opacity(0.45)), style: StrokeStyle(lineWidth: width * 0.65, lineCap: .round, dash: [5 * zoom, 5 * zoom]))
+                    if wire.implicit, let label = wire.label, zoom >= 0.7 {
+                        // Named, so a dashed wire isn't mistaken for one you made.
+                        let mid = Self.midpoint(from: Self.start(from), to: Self.end(to))
+                        let text = context.resolve(Text(label).font(.system(size: 10 * zoom, weight: .medium)).foregroundStyle(.secondary))
+                        let size = text.measure(in: CGSize(width: 200, height: 40))
+                        let pill = CGRect(x: mid.x - size.width / 2 - 6 * zoom, y: mid.y - size.height / 2 - 2 * zoom,
+                                          width: size.width + 12 * zoom, height: size.height + 4 * zoom)
+                        context.fill(Path(roundedRect: pill, cornerRadius: pill.height / 2), with: .color(Color(nsColor: .windowBackgroundColor)))
+                        context.stroke(Path(roundedRect: pill, cornerRadius: pill.height / 2), with: .color(.secondary.opacity(0.3)), lineWidth: 1)
+                        context.draw(text, at: mid)
+                    }
                     continue
                 }
                 let isSelected = wire.id == selected
@@ -1020,7 +1050,8 @@ private struct SuiteAppNode: View {
         let missing = audio.wiredOutputs(app).filter { uid in !audio.sources.contains { !$0.input && $0.uid == uid } }
         if !missing.isEmpty, wires.allSatisfy(\.implicit) { return "Output disconnected · on default" }
         if app.muted { return "Muted" }
-        return app.isPlaying ? "Playing" : "Not playing"
+        guard app.isPlaying else { return "Not playing" }
+        return wires.allSatisfy(\.implicit) ? (wires.first?.label == "app’s choice" ? "Playing on its own output" : "Playing on default") : "Playing"
     }
 }
 
@@ -1086,6 +1117,14 @@ private struct SuiteOutputNode: View {
                     Text("\(Int((audio.displayVolume(output) * 100).rounded()))%").font(.system(size: 11)).monospacedDigit()
                         .foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
                 }
+                let muted = audio.isMuted(output)
+                Button { audio.toggleMute(output: output) } label: {
+                    Image(systemName: muted ? "speaker.slash.fill" : "speaker.wave.1").frame(width: 16)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(muted ? Color.accentColor : .secondary)
+                .disabled(!audio.canMute(output))
+                .help(!audio.canMute(output) ? "\(audio.displayName(output)) can’t be muted from the Mac" : muted ? "Unmute \(audio.displayName(output))" : "Mute \(audio.displayName(output))")
             }
         }
         .padding(.horizontal, 14).padding(.vertical, 12)
@@ -1093,7 +1132,14 @@ private struct SuiteOutputNode: View {
 
     private var status: String {
         let alerts = audio.alertOutput?.uid == output.uid
-        if output.isDefault { return alerts ? "Default · alerts" : "Default" }
-        return alerts ? "Alerts" : "Output"
+        var parts: [String] = []
+        if output.isDefault { parts.append("Default") }
+        if alerts { parts.append("alerts") }
+        if audio.isMuted(output) { parts.append("muted") }
+        // Held back so it plays in step with a slower output carrying the same app.
+        let delay = audio.syncDelay(output)
+        if delay >= 1 { parts.append("synced +\(Int(delay.rounded())) ms") }
+        let text = parts.joined(separator: " · ")
+        return text.isEmpty ? "Output" : text.prefix(1).uppercased() + text.dropFirst()
     }
 }

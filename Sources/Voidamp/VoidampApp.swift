@@ -300,8 +300,11 @@ struct VoidampApp: App {
             let only = CommandLine.arguments.firstIndex(of: "--only").flatMap { CommandLine.arguments.indices.contains($0 + 1) ? CommandLine.arguments[$0 + 1] : nil }
             for app in controller.apps where app.isPlaying && (only.map { app.name.localizedCaseInsensitiveContains($0) } ?? true) {
                 // System Sounds move with macOS's alert device; the check never changes that setting.
-                if let targetName, !app.isSystem, let output = controller.sources.first(where: { !$0.input && $0.name.localizedCaseInsensitiveContains(targetName) }) {
-                    controller.connect(app, to: output)
+                // Several outputs can be named, separated by commas.
+                let targets = targetName.map { names in controller.sources.filter { source in !source.input && names.split(separator: ",").contains { source.name.localizedCaseInsensitiveContains($0) } } } ?? []
+                if !targets.isEmpty, !app.isSystem {
+                    if !controller.mixingEnabled { controller.enableMixing() }
+                    for output in targets { controller.connect(app, to: output) }
                 } else {
                     controller.setAppGain(app, 0.98)
                 }

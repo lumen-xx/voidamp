@@ -44,6 +44,8 @@ final class AudioController: ObservableObject {
     @Published private(set) var monitorGains: [String: Double] = [:]
     /// Why an input couldn't be monitored, by input UID.
     @Published private(set) var monitorFailures: [String: String] = [:]
+    /// Extra delay in milliseconds the user adds to an output, by UID, when its reported latency is off.
+    @Published private(set) var syncOffsets: [String: Double] = [:]
     /// The Suite's master switch. Off, every app plays on the default output and monitoring stops; the wiring is kept.
     @Published var suiteEnabled: Bool {
         didSet {
@@ -77,6 +79,7 @@ final class AudioController: ObservableObject {
         if let data = preferences.data(forKey: "appSettings"), let stored = try? JSONDecoder().decode([String: AppSetting].self, from: data) { appSettings = stored }
         monitorWiring = preferences.dictionary(forKey: "monitorWiring") as? [String: [String]] ?? [:]
         monitorGains = preferences.dictionary(forKey: "monitorGains") as? [String: Double] ?? [:]
+        syncOffsets = preferences.dictionary(forKey: "syncOffsets") as? [String: Double] ?? [:]
         refresh()
         if autoStartMixing { watcher = ProcessWatcher { [weak self] in self?.refreshApps() } }
         terminationObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
@@ -464,6 +467,22 @@ extension AudioController {
             guard app.isPlaying else { continue }
             for target in missing { startRoute(for: app, including: keep, output: target, defaultOutput: output) }
         }
+        alignRoutes()
+    }
+
+    /// Delays each app's faster outputs so all of its outputs play in step: Bluetooth runs far behind built-in
+    /// speakers. Uses the latency each device reports, plus the user's sync offset for that output.
+    private func alignRoutes() {
+        let bySource = Dictionary(grouping: routes, by: { $0.key.source })
+        for (_, group) in bySource {
+            guard group.count > 1 else {
+                group.first?.value.setDelay(seconds: 0)
+                continue
+            }
+            let latencies = group.map { ($0.value, outputLatency($0.key.output)) }
+            let slowest = latencies.map(\.1).max() ?? 0
+            for (route, latency) in latencies { route.setDelay(seconds: slowest - latency) }
+        }
     }
 
     private func startRoute(for app: AppSource, including extra: Set<AudioObjectID> = [], output: AudioSource, defaultOutput: AudioSource) {
@@ -502,7 +521,8 @@ extension AudioController {
             if !appRoutes.isEmpty {
                 return appRoutes.map { key, route in
                     let name = sources.first { !$0.input && $0.uid == key.output }?.name ?? key.output
-                    return "\(app.name) → \(name): \(route.callbackCount) audio callbacks"
+                    let delay = route.delaySeconds > 0 ? String(format: ", held back %.1f ms", route.delaySeconds * 1000) : ""
+                    return "\(app.name) → \(name): \(route.callbackCount) audio callbacks\(delay)"
                 }.sorted().joined(separator: "\n")
             }
             if let failure = routeFailures[app.id] { return "\(app.name): not routed (\(failure))" }
@@ -922,5 +942,76 @@ extension AudioController {
         if let live = apps.first(where: { $0.id == id }) { return live }
         let setting = appSettings[id] ?? .unchanged
         return AppSource(id: id, name: name, icon: icon, processes: [], gain: setting.gain, muted: setting.muted)
+    }
+}
+
+
+// MARK: Sync and output mute
+
+extension AudioController {
+    /// How long an output takes to play a sample, in seconds, as the device reports it, plus the user's offset.
+    func outputLatency(_ uid: String) -> Double {
+        let offset = (syncOffsets[uid] ?? 0) / 1000
+        guard let output = sources.first(where: { !$0.input && $0.uid == uid }) else { return offset }
+        let device = output.device
+        let rate = HAL.read(device, kAudioDevicePropertyNominalSampleRate, initial: Float64(0)) ?? 0
+        guard rate > 0 else { return offset }
+        var frames = scalar(device, address(kAudioDevicePropertyLatency), initial: UInt32(0)) ?? 0
+        frames += scalar(device, address(kAudioDevicePropertySafetyOffset), initial: UInt32(0)) ?? 0
+        frames += HAL.read(device, kAudioDevicePropertyBufferFrameSize, initial: UInt32(0)) ?? 0
+        if let stream = HAL.ids(device, kAudioDevicePropertyStreams, scope: kAudioDevicePropertyScopeOutput).first {
+            frames += HAL.read(stream, kAudioStreamPropertyLatency, initial: UInt32(0)) ?? 0
+        }
+        return Double(frames) / rate + offset
+    }
+
+    func syncOffset(_ output: AudioSource) -> Double { syncOffsets[output.uid] ?? 0 }
+    func setSyncOffset(_ output: AudioSource, milliseconds: Double) {
+        syncOffsets[output.uid] = milliseconds == 0 ? nil : milliseconds
+        preferences.set(syncOffsets, forKey: "syncOffsets")
+        updateRoutes(live: Set(HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList)), now: Date())
+    }
+
+    /// How much Voidamp holds back an output so it stays in step with slower ones, in milliseconds; 0 when it
+    /// isn't sharing an app with another output.
+    func syncDelay(_ output: AudioSource) -> Double {
+        (routes.filter { $0.key.output == output.uid }.map { $0.value.delaySeconds }.max() ?? 0) * 1000
+    }
+    /// Whether an output plays an app that also plays on another output, so syncing applies.
+    func sharesSource(_ output: AudioSource) -> Bool {
+        let sourcesHere = Set(routes.keys.filter { $0.output == output.uid }.map(\.source))
+        return routes.keys.contains { sourcesHere.contains($0.source) && $0.output != output.uid }
+    }
+
+    /// The output an app without wires plays on: the one it chose itself, or the default output.
+    func unwiredOutput(_ app: AppSource) -> AudioSource? {
+        if app.isSystem { return alertOutput ?? defaultOutputSource }
+        return ownOutput(app.id) ?? defaultOutputSource
+    }
+
+    // An output's own mute: the device's mute switch when it has one, otherwise its volume.
+
+    func canMute(_ output: AudioSource) -> Bool {
+        var property = address(kAudioDevicePropertyMute)
+        var settable: DarwinBoolean = false
+        let hardware = AudioObjectHasProperty(output.device, &property) && AudioObjectIsPropertySettable(output.device, &property, &settable) == noErr && settable.boolValue
+        return hardware || !output.channels.isEmpty
+    }
+    func isMuted(_ output: AudioSource) -> Bool {
+        var property = address(kAudioDevicePropertyMute)
+        if AudioObjectHasProperty(output.device, &property) { return scalar(output.device, property, initial: UInt32(0)) == 1 }
+        return !output.channels.isEmpty && output.volume == 0
+    }
+    func toggleMute(output: AudioSource) {
+        var property = address(kAudioDevicePropertyMute)
+        var settable: DarwinBoolean = false
+        if AudioObjectHasProperty(output.device, &property), AudioObjectIsPropertySettable(output.device, &property, &settable) == noErr, settable.boolValue {
+            var value: UInt32 = isMuted(output) ? 0 : 1
+            let status = AudioObjectSetPropertyData(output.device, &property, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value)
+            if status != noErr { error = "Couldn’t mute \(output.name) (\(status))." }
+            objectWillChange.send()
+        } else if !output.channels.isEmpty {
+            toggleMute(output)
+        }
     }
 }
