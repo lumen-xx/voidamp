@@ -89,9 +89,9 @@ final class AppRoute {
     private var observedCount: UInt64 = 0
     private var lastProgress = Date()
 
-    /// `mixdown` taps the apps wherever they play, for routes to a device other than the one they play on;
-    /// otherwise only their audio on `output` is tapped.
-    init(processes: [AudioObjectID], output: AudioDeviceID, gain: Double, mixdown: Bool = false) throws {
+    /// Taps the apps wherever they play (a stereo mixdown), not only on one device: when the default output
+    /// changes, apps move to it, and a tap on the old device would hear nothing while the app played unrouted.
+    init(processes: [AudioObjectID], output: AudioDeviceID, gain: Double) throws {
         self.processes = processes
         guard let uid = HAL.string(output, kAudioDevicePropertyDeviceUID) else { throw RoutingError(message: "No output device is available.") }
         outputUID = uid
@@ -99,7 +99,7 @@ final class AppRoute {
         sampleRate = HAL.read(output, kAudioDevicePropertyNominalSampleRate, initial: Float64(0)).flatMap { $0 > 0 ? $0 : nil } ?? 48_000
         delayLine = DelayLine(capacity: Int(sampleRate))
         do {
-            let description = mixdown ? CATapDescription(stereoMixdownOfProcesses: processes) : CATapDescription(processes: processes, deviceUID: uid, stream: 0)
+            let description = CATapDescription(stereoMixdownOfProcesses: processes)
             description.name = "Voidamp app audio"
             description.isPrivate = true
             description.muteBehavior = .mutedWhenTapped

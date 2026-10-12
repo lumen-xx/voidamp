@@ -486,7 +486,7 @@ extension AudioController {
             }
             // An app back at 100%, unmuted and on the default output plays directly again; nothing to rebuild.
             guard app.isPlaying else { continue }
-            for target in missing { startRoute(for: app, including: keep, output: target, defaultOutput: output) }
+            for target in missing { startRoute(for: app, including: keep, output: target) }
         }
         // A route that stays (same app, same output) can still need a new level: patchbay mode silences an app
         // whose last wire went to the output it falls back to.
@@ -509,7 +509,7 @@ extension AudioController {
         }
     }
 
-    private func startRoute(for app: AppSource, including extra: Set<AudioObjectID> = [], output: AudioSource, defaultOutput: AudioSource) {
+    private func startRoute(for app: AppSource, including extra: Set<AudioObjectID> = [], output: AudioSource) {
         let processes = Set(app.processes).union(extra)
         guard !captureBlocked, !processes.isEmpty else { return }
         if let failed = failedProcesses[app.id] {
@@ -519,9 +519,7 @@ extension AudioController {
             routeFailures.removeValue(forKey: app.id)
         }
         do {
-            // Audio headed for another device than the default is tapped wherever the app plays it.
-            let mixdown = output.uid != defaultOutput.uid || app.isSystem
-            routes[RouteKey(source: app.id, output: output.uid)] = try AppRoute(processes: processes.sorted(), output: output.device, gain: effectiveGain(app.id), mixdown: mixdown)
+            routes[RouteKey(source: app.id, output: output.uid)] = try AppRoute(processes: processes.sorted(), output: output.device, gain: effectiveGain(app.id))
         } catch {
             for key in routes.keys where key.source == app.id { routes.removeValue(forKey: key) }
             fail(app, .message(error.localizedDescription))
