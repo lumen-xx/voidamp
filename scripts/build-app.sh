@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VERSION="${VOIDAMP_VERSION:-1.1.27}"
-BUILD="${VOIDAMP_BUILD:-29}"
+VERSION="${VOIDAMP_VERSION:-1.1.28}"
+BUILD="${VOIDAMP_BUILD:-30}"
 APP="$(pwd)/dist/Voidamp.app"
 swift build -c release
 BIN_PATH="$(swift build -c release --show-bin-path)"
@@ -48,6 +48,8 @@ UPDATE_REPOSITORY="$(cat updates/repository.txt)"
 # Preserve Sparkle's upstream signatures, including its nested helpers.
 # A stable identity keeps macOS's Screen & System Audio Recording permission across updates; an ad-hoc
 # signature changes with every build, so macOS stops honouring the permission after each update.
+# The virtual microphone driver ships inside the app; Voidamp installs it on request.
+bash scripts/build-driver.sh "$APP/Contents/Resources"
 SIGNING_KEYCHAIN="$(bash scripts/signing-identity.sh)"
 codesign --force --keychain "$SIGNING_KEYCHAIN" --sign "Voidamp Local Signing" "$APP"
 if ! codesign -d --requirements - "$APP" 2>&1 | grep -q "certificate leaf"; then

@@ -56,6 +56,8 @@ struct SuiteItem: Identifiable, Equatable {
     let icon: NSImage?
     let symbol: String
     var playing = false
+    /// One of Voidamp's virtual microphones: an output in the Suite that apps hear as a microphone.
+    var virtual = false
     var isSource: Bool { kind != .output }
 
     static func == (lhs: SuiteItem, rhs: SuiteItem) -> Bool {
@@ -282,11 +284,13 @@ struct SuiteView: View {
             if $0.playing != $1.playing { return $0.playing }
             return $0.title.localizedStandardCompare($1.title) == .orderedAscending
         }
-        let inputs = audio.sources.filter(\.input).map {
+        // A virtual mic's input side is what apps record; in the Suite it only appears as something to wire into.
+        let inputs = audio.sources.filter { $0.input && !$0.isVirtualMic }.map {
             SuiteItem(id: "in:" + $0.uid, kind: .input, title: audio.displayName($0), icon: nil, symbol: "mic.fill")
         }
         let outputs = audio.sources.filter { !$0.input }.map {
-            SuiteItem(id: "out:" + $0.uid, kind: .output, title: audio.displayName($0), icon: nil, symbol: Self.outputSymbol($0))
+            SuiteItem(id: "out:" + $0.uid, kind: .output, title: audio.displayName($0), icon: nil,
+                      symbol: $0.isVirtualMic ? "waveform.and.mic" : Self.outputSymbol($0), virtual: $0.isVirtualMic)
         }
         return sortedApps + inputs + outputs
     }
@@ -307,22 +311,62 @@ private struct SuiteSidebar: View {
     @ObservedObject var audio: AudioController
     @ObservedObject var board: SuiteBoard
     let catalog: [SuiteItem]
+    @ObservedObject private var virtualMics = VirtualMics.shared
 
     var body: some View {
-        List {
-            section("Apps", kind: .app)
-            section("Inputs", kind: .input)
-            section("Outputs", kind: .output)
+        // The controls sit below the list rather than over it, so rows never scroll behind them.
+        VStack(spacing: 0) {
+            List {
+                section("Apps", kind: .app)
+                section("Inputs", kind: .input)
+                section("Outputs", kind: .output)
+                virtualSection
+            }
+            .listStyle(.sidebar)
+            .scrollIndicators(.never)
+            controls
         }
-        .listStyle(.sidebar)
-        .scrollIndicators(.never)
-        .safeAreaInset(edge: .bottom) { controls }
     }
 
     private func section(_ title: String, kind: SuiteNodeKind) -> some View {
         Section(title) {
-            ForEach(catalog.filter { $0.kind == kind }) { item in
+            ForEach(catalog.filter { $0.kind == kind && !$0.virtual }) { item in
                 row(item)
+            }
+        }
+    }
+
+    /// Voidamp's virtual microphones, or the offer to add them.
+    private var virtualSection: some View {
+        Section("Virtual Mics") {
+            let mics = catalog.filter(\.virtual)
+            ForEach(mics) { item in
+                row(item).contextMenu {
+                    if board.placed[item.id] != nil {
+                        Button("Remove from Board") { board.remove([item.id], audio: audio, catalog: catalog) }
+                    } else {
+                        Button("Add to Board") { board.place(item, at: board.freeSpot(for: item)) }
+                    }
+                    Divider()
+                    Button("Remove Virtual Mics…") { virtualMics.uninstall() }
+                }
+            }
+            switch virtualMics.state {
+            case .notInstalled, .outdated:
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(virtualMics.state == .outdated ? "A newer version of the virtual mics is ready."
+                                                        : "Mics for Discord, FL Studio and more.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Button(virtualMics.state == .outdated ? "Update Virtual Mics…" : "Add Virtual Mics…") { virtualMics.install() }
+                        .controlSize(.small)
+                }
+                .padding(.vertical, 4)
+            case .installed where mics.isEmpty:
+                Text("Starting…").font(.system(size: 11)).foregroundStyle(.secondary)
+            case .unavailable:
+                Text("Not included in this build").font(.system(size: 11)).foregroundStyle(.tertiary)
+            default:
+                EmptyView()
             }
         }
     }
@@ -624,7 +668,11 @@ private struct SuiteCanvas: View {
             }
         case .output:
             if let output = audio.sources.first(where: { !$0.input && $0.uid == item.key }) {
-                SuiteOutputNode(audio: audio, output: output, meters: meters, symbol: item.symbol)
+                if output.isVirtualMic {
+                    SuiteVirtualMicNode(audio: audio, output: output, meters: meters)
+                } else {
+                    SuiteOutputNode(audio: audio, output: output, meters: meters, symbol: item.symbol)
+                }
             }
         }
     }
@@ -716,6 +764,12 @@ private struct SuiteCanvas: View {
             }
             // Apps recording from this microphone, chosen in the app's own settings: shown, not wireable.
             for id in audio.appIDsUsing(input: input) where onBoard.contains("app:" + id) {
+                wires.append(SuiteWire(from: item.id, to: "app:" + id, implicit: true, label: "mic in use"))
+            }
+        }
+        for item in nodes where item.virtual {
+            guard let micSide = audio.sources.first(where: { $0.input && $0.uid == item.key }) else { continue }
+            for id in audio.appIDsUsing(input: micSide) where onBoard.contains("app:" + id) {
                 wires.append(SuiteWire(from: item.id, to: "app:" + id, implicit: true, label: "mic in use"))
             }
         }
@@ -1092,8 +1146,11 @@ private struct SuiteInputNode: View {
         if audio.micMuted { return "Muted" }
         // Which apps record from this microphone; each app picks its own input in its settings.
         let users = audio.appsUsing(input: input)
-        let state = !users.isEmpty ? "Used by " + users.joined(separator: ", ")
-            : audio.monitorOutputs(input).isEmpty ? "Wire to an output to listen" : "Monitoring"
+        let wired = audio.monitorOutputs(input).compactMap { uid in audio.sources.first { !$0.input && $0.uid == uid } }
+        let intoMics = wired.filter(\.isVirtualMic).map { audio.displayName($0) }
+        let state = !intoMics.isEmpty ? "Into " + intoMics.joined(separator: ", ")
+            : !users.isEmpty ? "Used by " + users.joined(separator: ", ")
+            : wired.isEmpty ? "Wire to an output to listen" : "Monitoring"
         return input.isDefault ? "Default · " + state : state
     }
     private var statusColor: Color { audio.monitorFailures[input.uid] != nil || feedbackRisk ? .orange : .secondary }
@@ -1188,5 +1245,31 @@ private struct SuiteSyncButton: View {
     private var offsetText: String {
         let value = Int(audio.syncOffset(output))
         return value == 0 ? "0 ms" : "\(value > 0 ? "+" : "−")\(abs(value)) ms"
+    }
+}
+
+/// A virtual microphone: wire a microphone or an app into it, and pick it as the microphone in another app.
+private struct SuiteVirtualMicNode: View {
+    @ObservedObject var audio: AudioController
+    let output: AudioSource
+    @ObservedObject var meters: SuiteMeters
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            SuiteNodeHeader(icon: AnyView(Image(systemName: "waveform.and.mic").font(.system(size: 15)).foregroundStyle(Color.accentColor)),
+                            title: audio.displayName(output), status: status)
+            SuiteMeter(level: meters.levels["out:" + output.uid] ?? 0, live: true)
+            Text(hint).font(.system(size: 11)).foregroundStyle(.tertiary).lineLimit(1)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 12)
+    }
+
+    private var micSide: AudioSource? { audio.sources.first { $0.input && $0.uid == output.uid } }
+    private var users: [String] { micSide.map { audio.appsUsing(input: $0) } ?? [] }
+    private var status: String {
+        users.isEmpty ? "Virtual mic · no app uses it yet" : "Heard by " + users.joined(separator: ", ")
+    }
+    private var hint: String {
+        users.isEmpty ? "Choose “\(audio.displayName(output))” as the mic in an app" : "Wire a mic or an app into it"
     }
 }

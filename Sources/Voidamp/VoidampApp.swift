@@ -317,6 +317,28 @@ struct VoidampApp: App {
             for (uid, peak) in loudest.sorted(by: { $0.key < $1.key }) {
                 print("Output \(controller.sources.first { !$0.input && $0.uid == uid }?.name ?? uid): peak \(peak)")
             }
+            // `--patchbay` then puts the checked apps on the board, turns Patchbay on and removes their wires:
+            // they must go silent.
+            if CommandLine.arguments.contains("--patchbay"), let only {
+                let checked = controller.apps.filter { $0.isPlaying && !$0.isSystem && $0.name.localizedCaseInsensitiveContains(only) }
+                var board = UserDefaults.standard.dictionary(forKey: "suiteBoard") ?? [:]
+                for app in checked { board["app:" + app.id] = [0.0, 0.0] }
+                UserDefaults.standard.set(board, forKey: "suiteBoard")
+                // A level other than 100% gives each app a route first, the case where a kept route kept playing.
+                for app in checked { controller.setAppGain(app, 0.9) }
+                RunLoop.current.run(until: Date().addingTimeInterval(1))
+                controller.patchbayMode = true
+                for app in checked { for uid in controller.wiredOutputs(app) { controller.disconnect(app, from: uid) } }
+                _ = controller.takePeaks()
+                var after: Float = 0
+                for _ in 0..<20 {
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+                    after = max(after, controller.takePeaks().outputs.values.max() ?? 0)
+                }
+                print("Patchbay, unwired: peak \(after) on \(controller.routingDiagnostics().filter { line in checked.contains { line.hasPrefix($0.name) } }.joined(separator: "; "))")
+                for app in checked { board.removeValue(forKey: "app:" + app.id) }
+                UserDefaults.standard.set(board, forKey: "suiteBoard")
+            }
             preferences.removePersistentDomain(forName: suite)
             for line in controller.routingDiagnostics() { print(line) }
             if let error = controller.error { print(error) }
@@ -630,6 +652,7 @@ struct MixerView: View {
     }
 
     private func deviceSymbol(_ source: AudioSource) -> String {
+        if source.isVirtualMic { return "waveform.and.mic" }
         let name = source.name.lowercased()
         if name.contains("airpods") { return source.input ? "mic" : "airpods" }
         if name.contains("headphone") || name.contains("headset") || name.contains("beats") { return source.input ? "mic" : "headphones" }
@@ -642,7 +665,8 @@ struct MixerView: View {
     private func deviceSection(_ title: String, input: Bool) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(MixerStyle.section).foregroundStyle(.tertiary)
-            ForEach(audio.sources.filter { $0.input == input }) { source in
+            // Virtual mics are microphones to apps; their output side is only for the Suite to feed.
+            ForEach(audio.sources.filter { $0.input == input && (input || !$0.isVirtualMic) }) { source in
                 let live = audio.sources.first(where: { $0.id == source.id }) ?? source
                 // The icon is centred beside the name and its volume; the selected device shows through its
                 // accent background, icon and name weight rather than a checkmark.

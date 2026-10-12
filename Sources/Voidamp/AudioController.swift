@@ -488,6 +488,9 @@ extension AudioController {
             guard app.isPlaying else { continue }
             for target in missing { startRoute(for: app, including: keep, output: target, defaultOutput: output) }
         }
+        // A route that stays (same app, same output) can still need a new level: patchbay mode silences an app
+        // whose last wire went to the output it falls back to.
+        applyRouteGains()
         alignRoutes()
     }
 
@@ -851,7 +854,8 @@ extension AudioController {
     var monitoringActive: Bool {
         guard suiteEnabled else { return false }
         return monitorWiring.contains { input, outputs in
-            sources.contains { $0.input && $0.uid == input } && outputs.contains { uid in sources.contains { !$0.input && $0.uid == uid } }
+            // Feeding a virtual mic isn't hearing yourself.
+            sources.contains { $0.input && $0.uid == input } && outputs.contains { uid in sources.contains { !$0.input && !$0.isVirtualMic && $0.uid == uid } }
         }
     }
 

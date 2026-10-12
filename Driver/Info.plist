@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key><string>en</string>
+	<key>CFBundleExecutable</key><string>VoidampMic</string>
+	<key>CFBundleIdentifier</key><string>app.voidamp.mic</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundleName</key><string>Voidamp Mic</string>
+	<key>CFBundlePackageType</key><string>BNDL</string>
+	<key>CFBundleShortVersionString</key><string>DRIVER_VERSION</string>
+	<key>CFBundleVersion</key><string>DRIVER_BUILD</string>
+	<key>LSMinimumSystemVersion</key><string>14.2</string>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>3B86A6A7-79AB-48F3-8B57-641C6EF654D6</key><string>VoidampMic_Create</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array><string>3B86A6A7-79AB-48F3-8B57-641C6EF654D6</string></array>
+	</dict>
+</dict>
+</plist>
