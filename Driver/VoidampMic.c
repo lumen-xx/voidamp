@@ -35,6 +35,8 @@ typedef struct {
     Boolean inputActive;
     Boolean outputActive;
     Float32 *ring;
+    /// The name apps show; renamed from Voidamp and kept in the host's storage for this plug-in.
+    CFStringRef name;
     pthread_mutex_t mutex;
 } Device;
 
@@ -145,6 +147,8 @@ static ULONG Release(void *driver) {
 
 // MARK: - Plug-in lifecycle
 
+static CFStringRef StoredName(UInt32 i);
+
 static OSStatus Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef host) {
     if (driver != gDriver) return kAudioHardwareBadObjectError;
     gHost = host;
@@ -158,7 +162,10 @@ static OSStatus Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInH
         device->inputActive = true;
         device->outputActive = true;
         device->ring = calloc((size_t)kRingFrames * kChannels, sizeof(Float32));
+        if (device->ring == NULL) return kAudioHardwareIllegalOperationError;
         pthread_mutex_init(&device->mutex, NULL);
+        if (device->name) CFRelease(device->name);
+        device->name = StoredName(i);
     }
     return noErr;
 }
@@ -214,7 +221,56 @@ static OSStatus RequestRate(int index, Float64 rate) {
 
 // MARK: - Properties
 
-static CFStringRef DeviceName(UInt32 i) { return CFStringCreateWithFormat(NULL, NULL, CFSTR("Voidamp Mic %u"), (unsigned)(i + 1)); }
+static CFStringRef DefaultName(UInt32 i) { return CFStringCreateWithFormat(NULL, NULL, CFSTR("Voidamp Mic %u"), (unsigned)(i + 1)); }
+static CFStringRef NameStorageKey(UInt32 i) { return CFStringCreateWithFormat(NULL, NULL, CFSTR("name.%u"), (unsigned)(i + 1)); }
+
+// The name to hand out, retained for the caller (the host releases it).
+static CFStringRef CopyName(UInt32 i) {
+    Device *device = &gDevices[i];
+    pthread_mutex_lock(&device->mutex);
+    CFStringRef name = (CFStringRef)CFRetain(device->name);
+    pthread_mutex_unlock(&device->mutex);
+    return name;
+}
+
+// A name chosen in Voidamp, or the default when none is stored.
+static CFStringRef StoredName(UInt32 i) {
+    CFPropertyListRef stored = NULL;
+    CFStringRef key = NameStorageKey(i);
+    if (gHost) gHost->CopyFromStorage(gHost, key, &stored);
+    CFRelease(key);
+    if (stored && CFGetTypeID(stored) == CFStringGetTypeID() && CFStringGetLength((CFStringRef)stored) > 0) return (CFStringRef)stored;
+    if (stored) CFRelease(stored);
+    return DefaultName(i);
+}
+
+// Renames a device. Surrounding spaces are dropped, names are kept to 64 characters, and an empty name brings back
+// the default.
+static OSStatus Rename(AudioObjectID object, UInt32 index, CFStringRef requested, const AudioObjectPropertyAddress *address) {
+    if (requested == NULL || CFGetTypeID(requested) != CFStringGetTypeID()) return kAudioHardwareIllegalOperationError;
+    CFMutableStringRef trimmed = CFStringCreateMutableCopy(NULL, 0, requested);
+    CFStringTrimWhitespace(trimmed);
+    CFIndex length = CFStringGetLength(trimmed);
+    CFStringRef key = NameStorageKey(index);
+    CFStringRef next;
+    if (length == 0) {
+        next = DefaultName(index);
+        if (gHost) gHost->DeleteFromStorage(gHost, key);
+    } else {
+        next = CFStringCreateWithSubstring(NULL, trimmed, CFRangeMake(0, length > 64 ? 64 : length));
+        if (gHost) gHost->WriteToStorage(gHost, key, next);
+    }
+    CFRelease(key);
+    CFRelease(trimmed);
+    Device *device = &gDevices[index];
+    pthread_mutex_lock(&device->mutex);
+    CFStringRef previous = device->name;
+    device->name = next;
+    pthread_mutex_unlock(&device->mutex);
+    if (previous) CFRelease(previous);
+    if (gHost) gHost->PropertiesChanged(gHost, object, 1, address);
+    return noErr;
+}
 static CFStringRef DeviceUID(UInt32 i) { return CFStringCreateWithFormat(NULL, NULL, CFSTR("app.voidamp.mic.%u"), (unsigned)(i + 1)); }
 
 static Boolean HasProperty(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t client, const AudioObjectPropertyAddress *address) {
@@ -263,7 +319,7 @@ static OSStatus IsPropertySettable(AudioServerPlugInDriverRef driver, AudioObjec
     enum ObjectKind kind = kKindDevice;
     Boolean isDevice = DeviceIndex(object, &kind) >= 0;
     switch (address->mSelector) {
-        case kAudioDevicePropertyNominalSampleRate:
+        case kAudioDevicePropertyNominalSampleRate: case kAudioObjectPropertyName:
             *outSettable = isDevice && kind == kKindDevice; break;
         case kAudioStreamPropertyIsActive: case kAudioStreamPropertyVirtualFormat: case kAudioStreamPropertyPhysicalFormat:
             *outSettable = isDevice && kind != kKindDevice; break;
@@ -359,7 +415,7 @@ static OSStatus GetDeviceProperty(UInt32 index, const AudioObjectPropertyAddress
         case kAudioObjectPropertyBaseClass: REQUIRE_SIZE(AudioClassID); *(AudioClassID *)outData = kAudioObjectClassID; return noErr;
         case kAudioObjectPropertyClass: REQUIRE_SIZE(AudioClassID); *(AudioClassID *)outData = kAudioDeviceClassID; return noErr;
         case kAudioObjectPropertyOwner: REQUIRE_SIZE(AudioObjectID); *(AudioObjectID *)outData = kAudioObjectPlugInObject; return noErr;
-        case kAudioObjectPropertyName: REQUIRE_SIZE(CFStringRef); *(CFStringRef *)outData = DeviceName(index); return noErr;
+        case kAudioObjectPropertyName: REQUIRE_SIZE(CFStringRef); *(CFStringRef *)outData = CopyName(index); return noErr;
         case kAudioObjectPropertyManufacturer: REQUIRE_SIZE(CFStringRef); *(CFStringRef *)outData = kManufacturer; return noErr;
         case kAudioDevicePropertyDeviceUID: REQUIRE_SIZE(CFStringRef); *(CFStringRef *)outData = DeviceUID(index); return noErr;
         case kAudioDevicePropertyModelUID: REQUIRE_SIZE(CFStringRef); *(CFStringRef *)outData = CFSTR("app.voidamp.mic.model"); return noErr;
@@ -503,6 +559,9 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef driver, AudioObjectID
                 return kAudioDeviceUnsupportedFormatError;
             return RequestRate(index, format->mSampleRate);
         }
+        case kAudioObjectPropertyName:
+            if (inSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
+            return Rename(object, (UInt32)index, *(const CFStringRef *)inData, address);
         case kAudioStreamPropertyIsActive: {
             if (inSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
             Boolean active = *(const UInt32 *)inData != 0;

@@ -66,6 +66,24 @@ final class VoidampRuntime: ObservableObject {
         return menu
     }
 
+    /// Renames a device: in Voidamp only, or for every app when it is one of Voidamp's virtual mics.
+    func askToRename(_ source: AudioSource) {
+        NSApplication.shared.unhide(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Rename “\(audio.displayName(source))”"
+        alert.informativeText = source.isVirtualMic
+            ? "Apps such as Discord show this name too; some only after you reopen them. Leave it empty for the original name."
+            : "This name is only used in Voidamp. Leave it empty for the original name."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.stringValue = audio.displayName(source)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        if alert.runModal() == .alertFirstButtonReturn { audio.renameDevice(source, to: field.stringValue) }
+    }
+
     /// Asks for a name until one is given; a name in use updates that profile.
     func askToSaveProfile() {
         closePanel()
@@ -562,7 +580,11 @@ struct MixerView: View {
                 if let source = renamingDevice { audio.renameDevice(source, to: deviceName) }
                 renamingDevice = nil
             }
-        } message: { Text("This name is only used in Voidamp. Leave empty to restore the original name.") }
+        } message: {
+            Text(renamingDevice?.isVirtualMic == true
+                 ? "Apps such as Discord show this name too. Leave empty to restore the original name."
+                 : "This name is only used in Voidamp. Leave empty to restore the original name.")
+        }
         .onReceive(loginItem.$error.compactMap { $0 }) { message in
             audio.error = message
             loginItem.error = nil

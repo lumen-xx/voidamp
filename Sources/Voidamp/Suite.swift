@@ -83,6 +83,8 @@ struct SuiteWire: Identifiable, Equatable {
     let implicit: Bool
     /// Says why an implicit wire goes where it does: "default" or "app’s choice".
     var label: String? = nil
+    /// For a wire drawn into an app: the virtual mic it really goes to.
+    var outputUID: String? = nil
     var id: String { "\(from)→\(to)" }
 }
 
@@ -396,6 +398,14 @@ private struct SuiteSidebar: View {
         }
     }
 
+    /// Devices can be renamed; virtual mics everywhere, others in Voidamp only.
+    @ViewBuilder
+    private func renameButton(_ item: SuiteItem) -> some View {
+        if item.kind != .app, let source = audio.sources.first(where: { $0.uid == item.key && $0.input == (item.kind == .input) }) {
+            Button("Rename…") { VoidampRuntime.shared.askToRename(source) }
+        }
+    }
+
     /// Voidamp's virtual microphones, or the offer to add them.
     private var virtualSection: some View {
         Section("Virtual Mics") {
@@ -407,6 +417,7 @@ private struct SuiteSidebar: View {
                     } else {
                         Button("Add to Board") { board.place(item, at: board.freeSpot(near: viewport.visibleCenter)) }
                     }
+                    renameButton(item)
                     Divider()
                     Button("Remove Virtual Mics…") { virtualMics.uninstall() }
                 }
@@ -463,6 +474,7 @@ private struct SuiteSidebar: View {
             } else {
                 Button("Add to Board") { board.place(item, at: board.freeSpot(near: viewport.visibleCenter)) }
             }
+            renameButton(item)
         }
         .help(onBoard ? "\(item.title) is on the board" : "Drag \(item.title) onto the board")
     }
@@ -510,7 +522,10 @@ private struct SuiteCanvas: View {
     let catalog: [SuiteItem]
     @State private var nodeDrag: (id: String, translation: CGSize)?
     @State private var panStart: CGSize?
-    @State private var pending: (from: String, point: CGPoint)?
+    /// A wire being dragged: from a node's port, or (`intoApp`) backwards from an app's input port.
+    @State private var pending: (from: String, point: CGPoint, intoApp: Bool)?
+    /// Apps already told which microphone to choose this session.
+    @State private var micHintsShown: Set<String> = []
     @State private var selectedWire: String?
     @State private var hoveredTarget: String?
     @State private var magnifyStart: CGFloat?
@@ -727,6 +742,9 @@ private struct SuiteCanvas: View {
             .scaleEffect(viewport.zoom)
             .position(x: frame.midX, y: frame.midY)
             .overlay {
+                if item.kind == .app && !item.id.hasSuffix(AppSource.systemSoundsID) { inputPort(item, wires: wires, frame: frame) }
+            }
+            .overlay {
                 port(item, wires: wires, frame: frame)
             }
     }
@@ -766,6 +784,9 @@ private struct SuiteCanvas: View {
 
         if item.kind == .input, let input = audio.sources.first(where: { $0.input && $0.uid == item.key }), !input.isDefault {
             Button("Use as Default Microphone") { audio.select(input) }
+        }
+        if item.kind != .app, let source = audio.sources.first(where: { $0.uid == item.key && $0.input == (item.kind == .input) }) {
+            Button("Rename…") { VoidampRuntime.shared.askToRename(source) }
         }
         Divider()
         Button(selectedNodes.count > 1 && selectedNodes.contains(item.id) ? "Remove \(selectedNodes.count) Items from Board" : "Remove from Board") {
@@ -852,18 +873,25 @@ private struct SuiteCanvas: View {
                 wires.append(SuiteWire(from: item.id, to: "app:" + id, implicit: true, label: "mic in use"))
             }
         }
+        // Wires into a virtual mic that feeds an app on the board are drawn into that app, the mic being plumbing.
+        let fed = Dictionary(audio.appInputs.compactMap { app, uid in onBoard.contains("app:" + app) ? (uid, "app:" + app) : nil }, uniquingKeysWith: { first, _ in first })
+        wires = wires.map { wire in
+            guard !wire.implicit, wire.to.hasPrefix("out:"), let app = fed[String(wire.to.dropFirst(4))], app != wire.from else { return wire }
+            return SuiteWire(from: wire.from, to: app, implicit: false, outputUID: String(wire.to.dropFirst(4)))
+        }
         // Only wires whose two ends are on the board are drawn.
         return wires.filter { onBoard.contains($0.from) && onBoard.contains($0.to) }
     }
 
     private func port(_ item: SuiteItem, wires: [SuiteWire], frame: CGRect) -> some View {
-        let connected = wires.contains { !$0.implicit && ($0.from == item.id || $0.to == item.id) }
+        // A source's port shows its outgoing wires; what feeds an app shows on the app's input port instead.
+        let connected = wires.contains { !$0.implicit && (item.isSource ? $0.from == item.id : $0.to == item.id) }
         let center = item.isSource ? SuiteWires.start(frame) : SuiteWires.end(frame)
         return SuitePort(connected: connected, active: hoveredTarget == item.id)
             .position(center)
             .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .named("canvas"))
                 .onChanged { value in
-                    pending = (item.id, value.location)
+                    pending = (item.id, value.location, false)
                     hoveredTarget = target(at: value.location, from: item)
                 }
                 .onEnded { value in
@@ -873,21 +901,51 @@ private struct SuiteCanvas: View {
                     pending = nil
                     hoveredTarget = nil
                 })
-            .help(item.isSource ? "Drag to an output" : "Drag to a source")
+            .help(item.isSource ? "Drag to an output, or onto an app to feed it" : "Drag to a source")
     }
 
-    /// The node under the pointer that a wire from `item` can end on: anywhere on a node of the other side.
+    /// An app's input, on its left edge: microphones and apps wired here play into it through a virtual mic.
+    private func inputPort(_ item: SuiteItem, wires: [SuiteWire], frame: CGRect) -> some View {
+        let connected = wires.contains { !$0.implicit && $0.to == item.id }
+        return SuitePort(connected: connected, active: hoveredTarget == item.id && pending?.intoApp == false)
+            .position(SuiteWires.end(frame))
+            .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .named("canvas"))
+                .onChanged { value in
+                    pending = (item.id, value.location, true)
+                    hoveredTarget = feedSource(at: value.location, into: item)
+                }
+                .onEnded { value in
+                    if let source = feedSource(at: value.location, into: item) { connect(source, item.id) }
+                    pending = nil
+                    hoveredTarget = nil
+                })
+            .help("Drag to a microphone or an app to feed it into \(item.title)")
+    }
+
+    /// A source that can feed an app: a microphone or another app.
+    private func feedSource(at point: CGPoint, into app: SuiteItem) -> String? {
+        let nodes = catalog.filter { board.placed[$0.id] != nil && $0.isSource && $0.id != app.id && $0.id != "app:" + AppSource.systemSoundsID }
+        return nodes.first { screenFrame($0.id)?.insetBy(dx: -14, dy: -6).contains(point) ?? false }?.id
+    }
+
+    /// The node under the pointer that a wire from `item` can end on: anywhere on a node of the other side, and for a
+    /// source also another app, to feed into it.
     private func target(at point: CGPoint, from item: SuiteItem) -> String? {
-        let nodes = catalog.filter { board.placed[$0.id] != nil && $0.isSource != item.isSource }
+        let nodes = catalog.filter { node in
+            guard board.placed[node.id] != nil, node.id != item.id else { return false }
+            if node.isSource != item.isSource { return true }
+            return item.isSource && item.id != "app:" + AppSource.systemSoundsID && node.kind == .app && node.id != "app:" + AppSource.systemSoundsID
+        }
         return nodes.first { screenFrame($0.id)?.insetBy(dx: -14, dy: -6).contains(point) ?? false }?.id
     }
 
     private func pendingLine(_ frames: [String: CGRect]) -> (CGPoint, CGPoint)? {
         guard let pending, let frame = frames[pending.from] else { return nil }
-        return pending.from.hasPrefix("out:") ? (pending.point, SuiteWires.end(frame)) : (SuiteWires.start(frame), pending.point)
+        return pending.from.hasPrefix("out:") || pending.intoApp ? (pending.point, SuiteWires.end(frame)) : (SuiteWires.start(frame), pending.point)
     }
 
     private func connect(_ sourceID: String, _ outputID: String) {
+        if outputID.hasPrefix("app:") { feed(sourceID, into: outputID); return }
         guard let output = audio.sources.first(where: { !$0.input && "out:" + $0.uid == outputID }),
               let item = catalog.first(where: { $0.id == sourceID }) else { return }
         if item.kind == .app {
@@ -897,9 +955,50 @@ private struct SuiteCanvas: View {
         }
     }
 
+    /// Feeds a microphone or an app into an app: wires it into the virtual mic that app records from, giving the
+    /// app one first if needed, and says once which microphone to choose in the app.
+    private func feed(_ sourceID: String, into appID: String) {
+        guard sourceID != appID, let target = catalog.first(where: { $0.id == appID }),
+              let source = catalog.first(where: { $0.id == sourceID }) else { return }
+        let app = audio.appSource(id: target.key, name: target.title, icon: target.icon)
+        switch audio.feedingMic(for: app, assign: true) {
+        case .success(let feed):
+            if source.kind == .app {
+                audio.connect(audio.appSource(id: source.key, name: source.title, icon: source.icon), to: feed.mic)
+            } else if let input = audio.sources.first(where: { $0.input && $0.uid == source.key }) {
+                audio.connect(input: input, to: feed.mic)
+            }
+            if audio.appHearsItsMic(app) != true, micHintsShown.insert(app.id).inserted {
+                // Where the setting lives, for apps people commonly use this with.
+                let place = app.name.localizedCaseInsensitiveContains("discord") ? " under Settings › Voice & Video › Input Device"
+                    : app.name.localizedCaseInsensitiveContains("fl studio") ? " under Options › Audio Settings"
+                    : app.name.localizedCaseInsensitiveContains("zoom") ? " under Settings › Audio › Microphone"
+                    : " in its audio or microphone settings"
+                explain("Choose “\(feed.name)” as the microphone in \(app.name)",
+                        "\(source.title) now plays into “\(feed.name)”. \(app.name) hears it once that’s its microphone\(place). You only do this once.")
+            }
+        case .failure(.noVirtualMics):
+            let alert = NSAlert()
+            alert.messageText = "Add Voidamp’s virtual mics first"
+            alert.informativeText = "Feeding \(source.title) into \(app.name) goes through a virtual mic that \(app.name) records from."
+            alert.addButton(withTitle: "Add Virtual Mics…")
+            alert.addButton(withTitle: "Cancel")
+            if alert.runModal() == .alertFirstButtonReturn { VirtualMics.shared.install() }
+        case .failure(.allTaken(let apps)):
+            explain("No virtual mic is free", "Both feed other apps (\(apps.joined(separator: ", "))). Remove the wires into one of them first.")
+        }
+    }
+
+    private func explain(_ title: String, _ text: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        alert.runModal()
+    }
+
     private func disconnect(_ wire: SuiteWire) {
         guard !wire.implicit, let item = catalog.first(where: { $0.id == wire.from }) else { return }
-        let outputUID = String(wire.to.dropFirst(4))
+        let outputUID = wire.outputUID ?? String(wire.to.dropFirst(4))
         if item.kind == .app {
             audio.disconnect(audio.appSource(id: item.key, name: item.title, icon: item.icon), from: outputUID)
         } else if let input = audio.sources.first(where: { $0.input && $0.uid == item.key }) {
@@ -1152,7 +1251,8 @@ private struct SuiteAppNode: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
-            SuiteNodeHeader(icon: AnyView(icon), title: app.name, status: status, statusColor: audio.routeFailures[app.id] == nil ? .secondary : .orange)
+            SuiteNodeHeader(icon: AnyView(icon), title: app.name, status: status,
+                            statusColor: audio.routeFailures[app.id] != nil || micHintPending ? .orange : .secondary)
             SuiteMeter(meters: meters, key: "src:" + app.id, live: audio.isRouted(app.id))
             HStack(spacing: 8) {
                 Slider(value: Binding(get: { app.gain }, set: { audio.setAppGain(app, $0, snapping: dragging) }), in: 0...2,
@@ -1181,6 +1281,23 @@ private struct SuiteAppNode: View {
         else { Image(systemName: app.isSystem ? "bell.fill" : "app.dashed").font(.system(size: 15)).foregroundStyle(.secondary) }
     }
 
+    /// For an app with things wired into it: whether it hears them yet.
+    private var micStatus: String? {
+        // Recording from a virtual mic with nothing in it: the other side of a call hears silence.
+        if let silent = audio.silentVirtualMic(for: app) { return "Its mic “\(silent.name)” is empty · wire a mic in" }
+        guard let uid = audio.feedingMicUID(for: app.id), audio.feedCount(intoMic: uid) > 0,
+              let mic = audio.sources.first(where: { $0.input && $0.uid == uid }) else { return nil }
+        switch audio.appHearsItsMic(app) {
+        case true?: return "Hears its \(audio.feedCount(intoMic: uid)) wired input\(audio.feedCount(intoMic: uid) == 1 ? "" : "s")"
+        case false?: return "Choose “\(mic.name)” as its mic"
+        case nil: return "Mic ready: “\(mic.name)”"
+        }
+    }
+    private var micHintPending: Bool {
+        audio.silentVirtualMic(for: app) != nil
+            || audio.feedingMicUID(for: app.id).map { audio.feedCount(intoMic: $0) > 0 } == true && audio.appHearsItsMic(app) == false
+    }
+
     private var status: String {
         if let failure = audio.routeFailures[app.id] {
             return failure == .noAudio ? "Can’t hear it · plays normally" : "Can’t route · plays normally"
@@ -1188,6 +1305,7 @@ private struct SuiteAppNode: View {
         if app.isSystem { return "Alerts and sound effects" }
         let missing = audio.wiredOutputs(app).filter { uid in !audio.sources.contains { !$0.input && $0.uid == uid } }
         if !missing.isEmpty, wires.allSatisfy(\.implicit) { return "Output disconnected · on default" }
+        if let hint = micStatus { return hint }
         if app.muted { return "Muted" }
         if audio.isSilencedByPatchbay(app) { return "Silent · wire it to an output" }
         guard app.isPlaying else { return "Not playing" }

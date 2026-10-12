@@ -22,7 +22,7 @@ Voidamp is not notarized yet. Only run this for Voidamp downloaded here.
 - Pick output and input devices, set their volume, mute sound or microphones, and rename devices with a right-click.
 - Save device, level and wiring setups as profiles under **More → Profiles**.
 - Click **Suite** to wire apps and microphones to any output in a node editor, for example Spotify to headphones and Safari to speakers.
-- Add **virtual mics** in the Suite: pick “Voidamp Mic 1” in Discord or any app and wire your microphone or an app into it.
+- Add **virtual mics** in the Suite, then drag your microphones (or an app) onto Discord or any app that records; pick the mic it names once in that app's settings.
 - Volume and brightness keys show Voidamp's own overlay. Hover over it to drag the level. Allow Accessibility when asked.
 - Right-click the menu bar icon for **More**: System Sounds, Start at Login and the overlay switch.
 

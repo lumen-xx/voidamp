@@ -17,14 +17,19 @@ static int gFailures = 0;
 static OSStatus PropertiesChanged(AudioServerPlugInHostRef host, AudioObjectID object, UInt32 count, const AudioObjectPropertyAddress *addresses) {
     (void)host; (void)object; (void)count; (void)addresses; return noErr;
 }
+// The host's storage for the plug-in, kept in memory.
+static CFMutableDictionaryRef gStorage;
 static OSStatus CopyFromStorage(AudioServerPlugInHostRef host, CFStringRef key, CFPropertyListRef *outData) {
-    (void)host; (void)key; *outData = NULL; return noErr;
+    (void)host;
+    CFPropertyListRef value = CFDictionaryGetValue(gStorage, key);
+    *outData = value ? CFRetain(value) : NULL;
+    return noErr;
 }
 static OSStatus WriteToStorage(AudioServerPlugInHostRef host, CFStringRef key, CFPropertyListRef data) {
-    (void)host; (void)key; (void)data; return noErr;
+    (void)host; CFDictionarySetValue(gStorage, key, data); return noErr;
 }
 static OSStatus DeleteFromStorage(AudioServerPlugInHostRef host, CFStringRef key) {
-    (void)host; (void)key; return noErr;
+    (void)host; CFDictionaryRemoveValue(gStorage, key); return noErr;
 }
 // Like coreaudiod, apply a requested change straight away.
 static OSStatus RequestChange(AudioServerPlugInHostRef host, AudioObjectID device, UInt64 action, void *info) {
@@ -64,6 +69,7 @@ int main(int argc, const char **argv) {
     HRESULT query = (*(AudioServerPlugInDriverRef)object)->QueryInterface(object, interface, (void **)&driver);
     CHECK(query == S_OK && driver != NULL, "driver interface is available");
     gDriver = driver;
+    gStorage = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     CHECK((*gDriver)->Initialize(gDriver, &gHost) == noErr, "initializes");
 
     AudioObjectID devices[8] = { 0 };
@@ -123,6 +129,31 @@ int main(int argc, const char **argv) {
     (*gDriver)->SetPropertyData(gDriver, 2, 0, &rate, 0, NULL, sizeof value, &value);
 
     CHECK(!(*gDriver)->HasProperty(gDriver, 99, 0, &rate), "unknown objects have no properties");
+
+    // Renaming: apps see the new name, it survives a restart of the driver, and an empty name restores the default.
+    AudioObjectPropertyAddress nameAddress = { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    Boolean settable = false;
+    (*gDriver)->IsPropertySettable(gDriver, 2, 0, &nameAddress, &settable);
+    CHECK(settable, "device name is settable");
+    CFStringRef newName = CFSTR("  Discord Mic  ");
+    CHECK((*gDriver)->SetPropertyData(gDriver, 2, 0, &nameAddress, 0, NULL, sizeof newName, &newName) == noErr, "renames Mic 1");
+    CFStringRef current = NULL;
+    Get(2, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, sizeof current, &current, NULL);
+    CHECK(current && StringEquals(current, "Discord Mic"), "apps see the new name, trimmed");
+    if (current) CFRelease(current);
+    (*gDriver)->Initialize(gDriver, &gHost);
+    Get(2, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, sizeof current, &current, NULL);
+    CHECK(current && StringEquals(current, "Discord Mic"), "the name survives a restart");
+    if (current) CFRelease(current);
+    Get(5, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, sizeof current, &current, NULL);
+    CHECK(current && StringEquals(current, "Voidamp Mic 2"), "Mic 2 keeps its name");
+    if (current) CFRelease(current);
+    CFStringRef empty = CFSTR(" ");
+    (*gDriver)->SetPropertyData(gDriver, 2, 0, &nameAddress, 0, NULL, sizeof empty, &empty);
+    Get(2, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, sizeof current, &current, NULL);
+    CHECK(current && StringEquals(current, "Voidamp Mic 1") && CFDictionaryGetCount(gStorage) == 0, "an empty name restores the default");
+    if (current) CFRelease(current);
+    CHECK((*gDriver)->SetPropertyData(gDriver, 3, 0, &nameAddress, 0, NULL, sizeof newName, &newName) != noErr, "streams can't be renamed");
 
     // IO: write a tone at an output time, read it back at the same input time, once.
     CHECK((*gDriver)->StartIO(gDriver, 2, 1) == noErr, "starts IO");

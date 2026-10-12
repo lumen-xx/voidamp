@@ -4,8 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DESTINATION="${1:?Usage: bash scripts/build-driver.sh DESTINATION [--unsigned]}"
-DRIVER_VERSION="1.0.0"
-DRIVER_BUILD="1"
+DRIVER_VERSION="1.1.0"
+DRIVER_BUILD="2"
 BUNDLE="$DESTINATION/VoidampMic.driver"
 rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS"

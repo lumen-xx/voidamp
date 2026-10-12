@@ -56,6 +56,9 @@ final class AudioController: ObservableObject {
             boardChanged()
         }
     }
+    /// The virtual mic that feeds each app, by app id: what is wired onto an app's input in the Suite plays into it,
+    /// and the app records from it once it is chosen as the app's microphone.
+    @Published private(set) var appInputs: [String: String] = [:]
     /// Extra delay in milliseconds for an output, by UID, when reported latencies are off: positive holds it back.
     @Published private(set) var syncOffsets: [String: Double] = [:]
     /// The Suite's master switch. Off, every app plays on the default output and monitoring stops; the wiring is kept.
@@ -116,6 +119,7 @@ final class AudioController: ObservableObject {
         monitorWiring = preferences.dictionary(forKey: "monitorWiring") as? [String: [String]] ?? [:]
         monitorGains = preferences.dictionary(forKey: "monitorGains") as? [String: Double] ?? [:]
         syncOffsets = preferences.dictionary(forKey: "syncOffsets") as? [String: Double] ?? [:]
+        appInputs = preferences.dictionary(forKey: "appInputs") as? [String: String] ?? [:]
         // Restores the mute a crash left behind, with the levels to return to.
         soundMuted = preferences.bool(forKey: "soundMuted")
         micMuted = preferences.bool(forKey: "micMuted")
@@ -867,8 +871,96 @@ private enum AudioOwner {
 
 extension AudioController {
     func displayName(_ source: AudioSource) -> String { deviceNames[source.uid] ?? source.name }
+    /// Why an app can't be fed: no virtual mics, or every one already feeds another app.
+    enum FeedProblem: Error { case noVirtualMics, allTaken([String]) }
+
+    /// The virtual mic that feeds an app: the one it records from now, the one it was given before, or (with
+    /// `assign`) a free one, renamed after the app so it is easy to pick in the app's microphone list.
+    struct Feed {
+        let mic: AudioSource
+        /// The name the app lists the mic under.
+        let name: String
+    }
+
+    func feedingMic(for app: AppSource, assign: Bool) -> Result<Feed, FeedProblem> {
+        let mics = sources.filter { !$0.input && $0.isVirtualMic }
+        guard !mics.isEmpty else { return .failure(.noVirtualMics) }
+        if let current = mics.first(where: { mic in sources.contains { $0.input && $0.uid == mic.uid && (inputUsers[$0.device]?.contains { $0.id == app.id } ?? false) } }) {
+            setAppInput(app.id, current.uid)
+            return .success(Feed(mic: current, name: current.name))
+        }
+        if let uid = appInputs[app.id], let mic = mics.first(where: { $0.uid == uid }) { return .success(Feed(mic: mic, name: mic.name)) }
+        // A mic given to another app stays with it while something is wired into it or an app records from it.
+        let busy = appInputs.filter { other, uid in other != app.id && (feedCount(intoMic: uid) > 0 || micIsRecorded(uid)) }
+        guard assign, let free = mics.first(where: { mic in !busy.values.contains(mic.uid) && !micIsRecorded(mic.uid) }) else {
+            return .failure(.allTaken(busy.keys.map { id in apps.first { $0.id == id }?.name ?? id }.sorted()))
+        }
+        setAppInput(app.id, free.uid)
+        let name = "\(app.name) (Voidamp)"
+        return .success(Feed(mic: free, name: setVirtualMicName(free, name) ? name : free.name))
+    }
+    /// A virtual mic an app records from although nothing is wired into it, so the app hears silence.
+    func silentVirtualMic(for app: AppSource) -> AudioSource? {
+        sources.first { $0.input && $0.isVirtualMic && feedCount(intoMic: $0.uid) == 0 && (inputUsers[$0.device]?.contains { $0.id == app.id } ?? false) }
+    }
+
+    /// How many microphones and apps are wired into a virtual mic.
+    func feedCount(intoMic uid: String) -> Int {
+        monitorWiring.values.filter { $0.contains(uid) }.count + appSettings.values.filter { $0.outputs.contains(uid) }.count
+    }
+    private func micIsRecorded(_ uid: String) -> Bool {
+        sources.contains { $0.input && $0.uid == uid && !(inputUsers[$0.device] ?? []).isEmpty }
+    }
+    /// The virtual mic already feeding an app, without assigning one.
+    func feedingMicUID(for appID: String) -> String? { appInputs[appID] }
+    /// Whether an app records from the virtual mic that feeds it; nil while it records nothing at all.
+    func appHearsItsMic(_ app: AppSource) -> Bool? {
+        guard let uid = appInputs[app.id], let micSide = sources.first(where: { $0.input && $0.uid == uid }) else { return nil }
+        let recording = inputUsers.values.contains { users in users.contains { $0.id == app.id } }
+        guard recording else { return nil }
+        return inputUsers[micSide.device]?.contains { $0.id == app.id } ?? false
+    }
+    private func setAppInput(_ appID: String, _ uid: String) {
+        guard appInputs[appID] != uid else { return }
+        // A virtual mic feeds one app at a time.
+        for (other, mic) in appInputs where mic == uid && other != appID { appInputs.removeValue(forKey: other) }
+        appInputs[appID] = uid
+        preferences.set(appInputs, forKey: "appInputs")
+    }
+    /// Sets a virtual mic's real name, quietly: older drivers can't be renamed, which isn't worth an alert here.
+    @discardableResult
+    private func setVirtualMicName(_ source: AudioSource, _ name: String) -> Bool {
+        var property = global(kAudioObjectPropertyName)
+        var settable: DarwinBoolean = false
+        guard AudioObjectIsPropertySettable(source.device, &property, &settable) == noErr, settable.boolValue else { return false }
+        var value = name as CFString
+        let status = withUnsafePointer(to: &value) { pointer in
+            AudioObjectSetPropertyData(source.device, &property, 0, nil, UInt32(MemoryLayout<CFString>.size), pointer)
+        }
+        scheduleRefresh()
+        return status == noErr
+    }
+
     func renameDevice(_ source: AudioSource, to name: String) {
         let cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if source.isVirtualMic {
+            // A virtual mic's name is the driver's own, which every app shows; empty brings back "Voidamp Mic N".
+            var property = global(kAudioObjectPropertyName)
+            var settable: DarwinBoolean = false
+            guard AudioObjectIsPropertySettable(source.device, &property, &settable) == noErr, settable.boolValue else {
+                error = "Update the virtual mics in Settings to rename them."
+                return
+            }
+            var value = cleaned as CFString
+            let status = withUnsafePointer(to: &value) { pointer in
+                AudioObjectSetPropertyData(source.device, &property, 0, nil, UInt32(MemoryLayout<CFString>.size), pointer)
+            }
+            if status != noErr { error = "Couldn’t rename \(source.name) (\(status))." }
+            deviceNames.removeValue(forKey: source.uid)
+            preferences.set(deviceNames, forKey: "deviceNames")
+            scheduleRefresh()
+            return
+        }
         if cleaned.isEmpty || cleaned == source.name { deviceNames.removeValue(forKey: source.uid) }
         else { deviceNames[source.uid] = cleaned }
         preferences.set(deviceNames, forKey: "deviceNames")
