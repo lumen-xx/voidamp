@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VERSION="${VOIDAMP_VERSION:-1.1.22}"
-BUILD="${VOIDAMP_BUILD:-24}"
+VERSION="${VOIDAMP_VERSION:-1.1.23}"
+BUILD="${VOIDAMP_BUILD:-25}"
 APP="$(pwd)/dist/Voidamp.app"
 swift build -c release
 BIN_PATH="$(swift build -c release --show-bin-path)"
@@ -29,6 +29,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>LSMinimumSystemVersion</key><string>14.2</string>
 <key>LSUIElement</key><true/>
+<key>NSMicrophoneUsageDescription</key><string>Voidamp plays a microphone on the outputs you wire it to in the Suite, so you can hear yourself. Audio stays on your Mac.</string>
 <key>NSAudioCaptureUsageDescription</key><string>Voidamp mixes application audio so you can control and boost each app’s volume. Audio stays on your Mac.</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>SUEnableAutomaticChecks</key><true/>

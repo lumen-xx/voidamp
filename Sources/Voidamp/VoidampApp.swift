@@ -14,6 +14,8 @@ final class VoidampRuntime: ObservableObject {
     /// The More menu, shared by the panel's ellipsis button and a right-click on the menu bar icon.
     func moreMenu() -> NSMenu {
         let menu = NSMenu()
+        menu.addItem(ClosureMenuItem("Open Voidamp Suite…") { SuiteWindowController.shared.show() })
+        menu.addItem(.separator())
         menu.addItem(ClosureMenuItem("Check for Updates…", enabled: updater.canCheckForUpdates) { [updater] in updater.checkForUpdates() })
         menu.addItem(ClosureMenuItem("Refresh sources") { [audio] in audio.refresh() })
         menu.addItem(.separator())
@@ -51,6 +53,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // `--overlay-snapshot <png> [--light]` renders the volume overlay card for review and quits.
         if let index = CommandLine.arguments.firstIndex(of: "--overlay-snapshot"), CommandLine.arguments.indices.contains(index + 1) {
             OverlaySnapshot.render(to: CommandLine.arguments[index + 1], dark: !CommandLine.arguments.contains("--light"))
+            return
+        }
+        // `--suite-preview` opens only the Suite, for screenshots, and prints its window number.
+        if CommandLine.arguments.contains("--suite-preview") {
+            SuiteWindowController.shared.show()
+            if let number = SuiteWindowController.shared.windowNumber { print("window \(number)"); fflush(stdout) }
             return
         }
         if CommandLine.arguments.contains("--updater-check") {
@@ -217,8 +225,24 @@ struct VoidampApp: App {
             let controller = AudioController(preferences: preferences)
             controller.enableMixing()
             // Untouched apps play directly; a level other than 100% makes each playing app use a route.
-            for app in controller.apps where app.isPlaying { controller.setAppGain(app, 0.98) }
-            RunLoop.current.run(until: Date().addingTimeInterval(3))
+            // `--route-to <name>` wires each playing app to that output instead.
+            let targetName = CommandLine.arguments.firstIndex(of: "--route-to").flatMap { CommandLine.arguments.indices.contains($0 + 1) ? CommandLine.arguments[$0 + 1] : nil }
+            for app in controller.apps where app.isPlaying {
+                // System Sounds move with macOS's alert device; the check never changes that setting.
+                if let targetName, !app.isSystem, let output = controller.sources.first(where: { !$0.input && $0.name.localizedCaseInsensitiveContains(targetName) }) {
+                    controller.connect(app, to: output)
+                } else {
+                    controller.setAppGain(app, 0.98)
+                }
+            }
+            var loudest: [String: Float] = [:]
+            for _ in 0..<30 {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+                for (id, peak) in controller.takePeaks().outputs { loudest[id] = max(loudest[id] ?? 0, peak) }
+            }
+            for (uid, peak) in loudest.sorted(by: { $0.key < $1.key }) {
+                print("Output \(controller.sources.first { !$0.input && $0.uid == uid }?.name ?? uid): peak \(peak)")
+            }
             preferences.removePersistentDomain(forName: suite)
             for line in controller.routingDiagnostics() { print(line) }
             if let error = controller.error { print(error) }
@@ -251,6 +275,11 @@ struct VoidampApp: App {
             precondition(ControlOverlay.step(0.51, up: true, steps: 16) == 0.5625 && ControlOverlay.step(1, up: true, steps: 16) == 1 && ControlOverlay.step(0, up: false, steps: 16) == 0)
             precondition(ControlOverlay.step(0.5, up: true, steps: 64) == 0.515625)
             precondition(MixerGain.adjusted(-1, snapping: false) == 0)
+            // Settings saved before the Suite have no outputs and still load.
+            let older = try! JSONDecoder().decode(AppSetting.self, from: Data(#"{"gain":1.5,"muted":true}"#.utf8))
+            precondition(older == AppSetting(gain: 1.5, muted: true) && older.outputs.isEmpty)
+            let wired = AppSetting(gain: 1, muted: false, outputs: ["a", "b"])
+            precondition(try! JSONDecoder().decode(AppSetting.self, from: JSONEncoder().encode(wired)) == wired)
             precondition(controller.apps.contains(where: \.isSystem), "System Sounds row missing")
             controller.showSystemSounds = false
             precondition(!controller.apps.contains(where: \.isSystem), "System Sounds row still shown")

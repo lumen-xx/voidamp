@@ -75,6 +75,7 @@ final class AppRoute {
     private var io: AudioDeviceIOProcID?
     private let gain = OSAllocatedUnfairLock(initialState: Float(1))
     private let callbacks = OSAllocatedUnfairLock(initialState: UInt64(0))
+    private let peak = OSAllocatedUnfairLock(initialState: Float(0))
     let createdAt = Date()
     var callbackCount: UInt64 { callbacks.withLock { $0 } }
     let processes: [AudioObjectID]
@@ -83,13 +84,15 @@ final class AppRoute {
     private var observedCount: UInt64 = 0
     private var lastProgress = Date()
 
-    init(processes: [AudioObjectID], output: AudioDeviceID, gain: Double) throws {
+    /// `mixdown` taps the apps wherever they play, for routes to a device other than the one they play on;
+    /// otherwise only their audio on `output` is tapped.
+    init(processes: [AudioObjectID], output: AudioDeviceID, gain: Double, mixdown: Bool = false) throws {
         self.processes = processes
         guard let uid = HAL.string(output, kAudioDevicePropertyDeviceUID) else { throw RoutingError(message: "No output device is available.") }
         outputUID = uid
         self.gain.withLock { $0 = Float(gain) }
         do {
-            let description = CATapDescription(processes: processes, deviceUID: uid, stream: 0)
+            let description = mixdown ? CATapDescription(stereoMixdownOfProcesses: processes) : CATapDescription(processes: processes, deviceUID: uid, stream: 0)
             description.name = "Voidamp app audio"
             description.isPrivate = true
             description.muteBehavior = .mutedWhenTapped
@@ -100,12 +103,12 @@ final class AppRoute {
                   format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
                   format.mBitsPerChannel == 32 else { throw RoutingError(message: "This output’s audio format can’t be mixed.") }
             let streams = HAL.ids(output, kAudioDevicePropertyStreams, scope: kAudioDevicePropertyScopeOutput)
+            // The route resamples the tap to the output's rate, so the rates may differ.
             guard let stream = streams.first,
                   let outputFormat = HAL.read(stream, kAudioStreamPropertyVirtualFormat, initial: AudioStreamBasicDescription()),
                   outputFormat.mFormatID == kAudioFormatLinearPCM,
                   outputFormat.mFormatFlags & kAudioFormatFlagIsFloat != 0,
-                  outputFormat.mBitsPerChannel == 32,
-                  outputFormat.mSampleRate == format.mSampleRate else { throw RoutingError(message: "This output’s audio format can’t be mixed.") }
+                  outputFormat.mBitsPerChannel == 32 else { throw RoutingError(message: "This output’s audio format can’t be mixed.") }
             let config: [String: Any] = [
                 kAudioAggregateDeviceNameKey: "Voidamp route",
                 kAudioAggregateDeviceUIDKey: "app.voidamp.route.\(UUID().uuidString)",
@@ -118,6 +121,7 @@ final class AppRoute {
             try check(AudioHardwareCreateAggregateDevice(config as CFDictionary, &aggregate), "Creating the audio route")
             let gainState = self.gain
             let callbackState = self.callbacks
+            let peakState = self.peak
             try check(AudioDeviceCreateIOProcIDWithBlock(&io, aggregate, nil) { _, input, _, output, _ in
                 let inputs = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
                 let outputs = UnsafeMutableAudioBufferListPointer(output)
@@ -130,6 +134,7 @@ final class AppRoute {
                 guard inputs[firstTapBuffer].mData != nil else { return }
                 callbackState.withLock { $0 += 1 }
                 let multiplier = gainState.withLock { $0 }
+                var loudest: Float = 0
                 var channelOffset = 0
                 for buffer in outputs {
                     guard let destination = buffer.mData else { continue }
@@ -153,11 +158,15 @@ final class AppRoute {
                         let frames = Int(source.mDataByteSize) / MemoryLayout<Float>.size / sourceChannels
                         for frame in 0..<outputFrames {
                             let sample: Float = frame < frames ? samples[frame * sourceChannels + (planar ? 0 : sourceChannel)] * multiplier : 0
-                            result[frame * channels + channel] = min(1, max(-1, sample))
+                            let clipped = min(1, max(-1, sample))
+                            result[frame * channels + channel] = clipped
+                            loudest = max(loudest, abs(clipped))
                         }
                     }
                     channelOffset += channels
                 }
+                let blockPeak = loudest
+                peakState.withLock { $0 = max($0, blockPeak) }
             }, "Starting the app mixer")
             try check(AudioDeviceStart(aggregate, io), "Playing the app’s audio")
         } catch {
@@ -177,6 +186,8 @@ final class AppRoute {
     }
 
     func setGain(_ value: Double) { gain.withLock { $0 = Float(value) } }
+    /// The loudest sample played since the last call, for level meters.
+    func takePeak() -> Float { peak.withLock { let value = $0; $0 = 0; return value } }
     func stop() {
         if let io {
             AudioDeviceStop(aggregate, io)
@@ -185,6 +196,93 @@ final class AppRoute {
         }
         if aggregate != 0 { AudioHardwareDestroyAggregateDevice(aggregate); aggregate = 0 }
         if tap != 0 { AudioHardwareDestroyProcessTap(tap); tap = 0 }
+    }
+    deinit { stop() }
+    private func check(_ status: OSStatus, _ operation: String) throws {
+        if status != noErr { throw RoutingError(message: "\(operation) failed (\(status)).") }
+    }
+}
+
+/// Plays a microphone or other input on an output, for monitoring. Both devices join one private aggregate; the
+/// input is drift-corrected against the output's clock. Channel 1 of the input is played on every output channel.
+@available(macOS 14.2, *)
+final class MonitorRoute {
+    private var aggregate: AudioObjectID = 0
+    private var io: AudioDeviceIOProcID?
+    private let gain = OSAllocatedUnfairLock(initialState: Float(1))
+    private let callbacks = OSAllocatedUnfairLock(initialState: UInt64(0))
+    private let peak = OSAllocatedUnfairLock(initialState: Float(0))
+    private var observedCount: UInt64 = 0
+    private var lastProgress = Date()
+
+    init(input: AudioDeviceID, output: AudioDeviceID, gain: Double) throws {
+        guard let inputUID = HAL.string(input, kAudioDevicePropertyDeviceUID),
+              let outputUID = HAL.string(output, kAudioDevicePropertyDeviceUID) else { throw RoutingError(message: "The device is no longer available.") }
+        self.gain.withLock { $0 = Float(gain) }
+        let subdevices: [[String: Any]] = inputUID == outputUID
+            ? [[kAudioSubDeviceUIDKey: outputUID]]
+            : [[kAudioSubDeviceUIDKey: outputUID, kAudioSubDeviceInputChannelsKey: 0],
+               [kAudioSubDeviceUIDKey: inputUID, kAudioSubDeviceOutputChannelsKey: 0, kAudioSubDeviceDriftCompensationKey: true]]
+        let config: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "Voidamp monitor",
+            kAudioAggregateDeviceUIDKey: "app.voidamp.route.monitor.\(UUID().uuidString)",
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceMainSubDeviceKey: outputUID,
+            kAudioAggregateDeviceSubDeviceListKey: subdevices
+        ]
+        do {
+            try check(AudioHardwareCreateAggregateDevice(config as CFDictionary, &aggregate), "Creating the monitor")
+            let gainState = self.gain, callbackState = self.callbacks, peakState = self.peak
+            try check(AudioDeviceCreateIOProcIDWithBlock(&io, aggregate, nil) { _, input, _, output, _ in
+                let inputs = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
+                let outputs = UnsafeMutableAudioBufferListPointer(output)
+                callbackState.withLock { $0 += 1 }
+                let source = inputs.first { $0.mData != nil && $0.mNumberChannels > 0 }
+                let multiplier = gainState.withLock { $0 }
+                var loudest: Float = 0
+                for buffer in outputs {
+                    guard let destination = buffer.mData else { continue }
+                    let result = destination.assumingMemoryBound(to: Float.self)
+                    let channels = Int(buffer.mNumberChannels)
+                    guard channels > 0 else { continue }
+                    let frames = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size / channels
+                    guard let source, let data = source.mData else {
+                        memset(destination, 0, Int(buffer.mDataByteSize)); continue
+                    }
+                    let samples = data.assumingMemoryBound(to: Float.self)
+                    let stride = Int(source.mNumberChannels)
+                    let available = Int(source.mDataByteSize) / MemoryLayout<Float>.size / stride
+                    for frame in 0..<frames {
+                        let sample = frame < available ? min(1, max(-1, samples[frame * stride] * multiplier)) : 0
+                        loudest = max(loudest, abs(sample))
+                        for channel in 0..<channels { result[frame * channels + channel] = sample }
+                    }
+                }
+                let blockPeak = loudest
+                peakState.withLock { $0 = max($0, blockPeak) }
+            }, "Starting the monitor")
+            try check(AudioDeviceStart(aggregate, io), "Playing the input")
+        } catch {
+            stop()
+            throw error
+        }
+    }
+
+    /// Whether audio is still flowing; a stalled monitor (sleep, a device reset) is rebuilt by the caller.
+    func stalled(now: Date = Date()) -> Bool {
+        let count = callbacks.withLock { $0 }
+        if count != observedCount { observedCount = count; lastProgress = now; return false }
+        return now.timeIntervalSince(lastProgress) > 2
+    }
+    func setGain(_ value: Double) { gain.withLock { $0 = Float(value) } }
+    func takePeak() -> Float { peak.withLock { let value = $0; $0 = 0; return value } }
+    func stop() {
+        if let io {
+            AudioDeviceStop(aggregate, io)
+            AudioDeviceDestroyIOProcID(aggregate, io)
+            self.io = nil
+        }
+        if aggregate != 0 { AudioHardwareDestroyAggregateDevice(aggregate); aggregate = 0 }
     }
     deinit { stop() }
     private func check(_ status: OSStatus, _ operation: String) throws {

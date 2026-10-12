@@ -26,6 +26,7 @@ A small macOS menu bar mixer for your apps, speakers, and microphones. Adjust Sa
 - Choose an output or input device and adjust its volume or microphone gain.
 - Right-click a device to give it a custom name in Voidamp.
 - Save your device selections, levels, and mute states as **profiles**.
+- Open **More → Open Voidamp Suite…** for a node editor. Drag apps, microphones and outputs from the sidebar onto the board, then drag a wire from an app to any output to play it there. Wire one app to several outputs, send alerts to their own device, or wire a microphone to headphones to hear yourself. Apps without a wire play on the default output. The mouse wheel zooms from 50% to 150%; drag the empty board to move around.
 - Volume and brightness keys show Voidamp’s own overlay at the top of the screen. Hover over it to drag the level or click the speaker to mute. It needs Accessibility permission and can be turned off with **More → Volume & Brightness Overlay**.
 - Check for signed updates from **More → Check for Updates…**. Right-click the menu bar icon for the same More menu.
 - Enable **More → Start at Login** to launch Voidamp automatically. If macOS asks for approval, use **Approve Start at Login…**.
