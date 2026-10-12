@@ -152,6 +152,8 @@ final class SuiteBoard: ObservableObject {
     private func save() {
         defaults.set(placed.mapValues { [Double($0.x), Double($0.y)] }, forKey: "suiteBoard")
         defaults.set(names, forKey: "suiteBoardNames")
+        // In patchbay mode, placing an app without wires silences it.
+        VoidampRuntime.shared.audio.boardChanged()
     }
 }
 
@@ -477,15 +479,22 @@ private struct SuiteCanvas: View {
         .ignoresSafeArea(.container, edges: .top)
     }
 
-    /// The Suite's master switch, in the title bar's corner.
+    /// Patchbay mode and the Suite's master switch, in the title bar's corner.
     private var suiteSwitch: some View {
-        Toggle(isOn: $audio.suiteEnabled) {
-            Text("Suite").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+        HStack(spacing: 16) {
+            Toggle(isOn: $audio.patchbayMode) {
+                Text("Patchbay").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+            }
+            .help(audio.patchbayMode ? "Patchbay: apps on the board play only where they’re wired; without a wire they’re silent."
+                                     : "Turn on Patchbay so apps on the board play only where they’re wired. Apps not on the board play as usual.")
+            Toggle(isOn: $audio.suiteEnabled) {
+                Text("Suite").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+            }
+            .help(audio.suiteEnabled ? "Turn the Suite off: every app plays on the default output and monitoring stops. Your wiring is kept."
+                                     : "Turn the Suite on to use your wiring again")
         }
         .toggleStyle(.switch)
         .controlSize(.small)
-        .help(audio.suiteEnabled ? "Turn the Suite off: every app plays on the default output and monitoring stops. Your wiring is kept."
-                                 : "Turn the Suite on to use your wiring again")
         .padding(.top, 14).padding(.trailing, 16)
     }
 
@@ -629,20 +638,7 @@ private struct SuiteCanvas: View {
         if item.kind == .output, let output = audio.sources.first(where: { !$0.input && $0.uid == item.key }), !output.isDefault {
             Button("Use as Default Output") { audio.select(output) }
         }
-        if item.kind == .output, let output = audio.sources.first(where: { !$0.input && $0.uid == item.key }) {
-            // Reported latencies are estimates, Bluetooth especially; this nudges one output when outputs drift apart.
-            Menu("Sync Offset") {
-                ForEach([-100.0, -50, -25, 0, 25, 50, 100, 150, 200], id: \.self) { value in
-                    Button {
-                        audio.setSyncOffset(output, milliseconds: value)
-                    } label: {
-                        let name = value == 0 ? "None" : "\(value > 0 ? "+" : "−")\(Int(abs(value))) ms"
-                        if audio.syncOffset(output) == value { Label(name, systemImage: "checkmark") } else { Text(name) }
-                    }
-                }
-            }
-            .help("If this output sounds early or late next to another, add or remove delay")
-        }
+
         if item.kind == .input, let input = audio.sources.first(where: { $0.input && $0.uid == item.key }), !input.isDefault {
             Button("Use as Default Microphone") { audio.select(input) }
         }
@@ -702,6 +698,9 @@ private struct SuiteCanvas: View {
             if app.isSystem, let alert = wired.first {
                 let onDefault = alert == defaultOutput?.uid
                 wires.append(SuiteWire(from: item.id, to: "out:" + alert, implicit: onDefault, label: onDefault ? "default" : nil))
+            } else if wired.isEmpty, audio.isSilencedByPatchbay(app) {
+                // Patchbay: nothing plays it, so no line.
+                continue
             } else if wired.isEmpty, let target = audio.unwiredOutput(app) {
                 // Unwired apps play where they would anyway: their own output setting, or the default output.
                 let label = target.uid == defaultOutput?.uid ? "default" : "app’s choice"
@@ -714,6 +713,10 @@ private struct SuiteCanvas: View {
             guard let input = audio.sources.first(where: { $0.input && $0.uid == item.key }) else { continue }
             for uid in audio.monitorOutputs(input) where outputs.contains(where: { $0.uid == uid }) {
                 wires.append(SuiteWire(from: item.id, to: "out:" + uid, implicit: false))
+            }
+            // Apps recording from this microphone, chosen in the app's own settings: shown, not wireable.
+            for id in audio.appIDsUsing(input: input) where onBoard.contains("app:" + id) {
+                wires.append(SuiteWire(from: item.id, to: "app:" + id, implicit: true, label: "mic in use"))
             }
         }
         // Only wires whose two ends are on the board are drawn.
@@ -1050,6 +1053,7 @@ private struct SuiteAppNode: View {
         let missing = audio.wiredOutputs(app).filter { uid in !audio.sources.contains { !$0.input && $0.uid == uid } }
         if !missing.isEmpty, wires.allSatisfy(\.implicit) { return "Output disconnected · on default" }
         if app.muted { return "Muted" }
+        if audio.isSilencedByPatchbay(app) { return "Silent · wire it to an output" }
         guard app.isPlaying else { return "Not playing" }
         return wires.allSatisfy(\.implicit) ? (wires.first?.label == "app’s choice" ? "Playing on its own output" : "Playing on default") : "Playing"
     }
@@ -1117,6 +1121,9 @@ private struct SuiteOutputNode: View {
                     Text("\(Int((audio.displayVolume(output) * 100).rounded()))%").font(.system(size: 11)).monospacedDigit()
                         .foregroundStyle(.secondary).frame(width: 36, alignment: .trailing)
                 }
+                if audio.sharesSource(output) || audio.syncOffset(output) != 0 {
+                    SuiteSyncButton(audio: audio, output: output)
+                }
                 let muted = audio.isMuted(output)
                 Button { audio.toggleMute(output: output) } label: {
                     Image(systemName: muted ? "speaker.slash.fill" : "speaker.wave.1").frame(width: 16)
@@ -1141,5 +1148,45 @@ private struct SuiteOutputNode: View {
         if delay >= 1 { parts.append("synced +\(Int(delay.rounded())) ms") }
         let text = parts.joined(separator: " · ")
         return text.isEmpty ? "Output" : text.prefix(1).uppercased() + text.dropFirst()
+    }
+}
+
+/// Fine-tunes how much an output is held back, live, while the same app plays on another output. Device latency
+/// reports are estimates; Bluetooth speakers often report far less than they really take.
+private struct SuiteSyncButton: View {
+    @ObservedObject var audio: AudioController
+    let output: AudioSource
+    @State private var open = false
+
+    var body: some View {
+        Button { open.toggle() } label: {
+            Image(systemName: "metronome").frame(width: 16)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(audio.syncOffset(output) != 0 ? Color.accentColor : .secondary)
+        .help("Sync with the other outputs")
+        .popover(isPresented: $open, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Sync \(audio.displayName(output))").font(.system(size: 13, weight: .semibold))
+                Text("Play something on both outputs and move the slider until they sound as one. Move right if this output is early, left if it’s late.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Slider(value: Binding(get: { audio.syncOffset(output) }, set: { audio.setSyncOffset(output, milliseconds: ($0 / 5).rounded() * 5) }), in: -300...500)
+                    Text(offsetText).font(.system(size: 11)).monospacedDigit().frame(width: 56, alignment: .trailing)
+                }
+                HStack {
+                    Text("Held back \(Int(audio.syncDelay(output).rounded())) ms in total").font(.system(size: 11)).foregroundStyle(.tertiary)
+                    Spacer()
+                    Button("Reset") { audio.setSyncOffset(output, milliseconds: 0) }.controlSize(.small).disabled(audio.syncOffset(output) == 0)
+                }
+            }
+            .padding(14)
+            .frame(width: 300)
+        }
+    }
+
+    private var offsetText: String {
+        let value = Int(audio.syncOffset(output))
+        return value == 0 ? "0 ms" : "\(value > 0 ? "+" : "−")\(abs(value)) ms"
     }
 }

@@ -552,7 +552,11 @@ struct MixerView: View {
             Text(app.name).font(MixerStyle.body).lineLimit(1).frame(width: 80, alignment: .leading).help(app.name)
             // Only apps the Suite sends somewhere other than the default output show where they play.
             let routed = audio.routedOutputs(app)
-            if !routed.isEmpty {
+            if audio.isSilencedByPatchbay(app) {
+                Image(systemName: "speaker.slash").font(.system(size: 10)).foregroundStyle(.secondary)
+                    .help("Silent: it’s on the Suite’s board in Patchbay mode without a wire")
+                    .accessibilityLabel("Silent in Patchbay mode")
+            } else if !routed.isEmpty {
                 HStack(spacing: 1) {
                     Image(systemName: deviceSymbol(routed[0]))
                     if routed.count > 1 { Text("\(routed.count)").monospacedDigit() }

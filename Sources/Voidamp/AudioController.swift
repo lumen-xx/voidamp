@@ -44,7 +44,16 @@ final class AudioController: ObservableObject {
     @Published private(set) var monitorGains: [String: Double] = [:]
     /// Why an input couldn't be monitored, by input UID.
     @Published private(set) var monitorFailures: [String: String] = [:]
-    /// Extra delay in milliseconds the user adds to an output, by UID, when its reported latency is off.
+    /// Patchbay mode: an app on the Suite's board plays only where it is wired; without wires it is silent.
+    /// Apps that aren't on the board play as usual.
+    @Published var patchbayMode: Bool {
+        didSet {
+            guard patchbayMode != oldValue else { return }
+            preferences.set(patchbayMode, forKey: "patchbayMode")
+            boardChanged()
+        }
+    }
+    /// Extra delay in milliseconds for an output, by UID, when reported latencies are off: positive holds it back.
     @Published private(set) var syncOffsets: [String: Double] = [:]
     /// The Suite's master switch. Off, every app plays on the default output and monitoring stops; the wiring is kept.
     @Published var suiteEnabled: Bool {
@@ -75,6 +84,7 @@ final class AudioController: ObservableObject {
         self.mixingEnabled = autoStartMixing
         self.showSystemSounds = preferences.object(forKey: "showSystemSounds") as? Bool ?? true
         self.suiteEnabled = preferences.object(forKey: "suiteEnabled") as? Bool ?? true
+        self.patchbayMode = preferences.object(forKey: "patchbayMode") as? Bool ?? false
         if let data = preferences.data(forKey: "profiles"), let stored = try? JSONDecoder().decode([MixerProfile].self, from: data) { profiles = stored }
         if let data = preferences.data(forKey: "appSettings"), let stored = try? JSONDecoder().decode([String: AppSetting].self, from: data) { appSettings = stored }
         monitorWiring = preferences.dictionary(forKey: "monitorWiring") as? [String: [String]] ?? [:]
@@ -378,7 +388,7 @@ extension AudioController {
 
     private func needsRoute(_ id: String) -> Bool {
         let setting = appSettings[id] ?? .unchanged
-        if setting.muted || abs(setting.gain - 1) > 0.001 { return true }
+        if setting.muted || abs(setting.gain - 1) > 0.001 || silencedByPatchbay(id) { return true }
         // Wired elsewhere than the default output. System Sounds move with macOS's alert device instead.
         guard id != AppSource.systemSoundsID, let defaultOutput = defaultOutputSource else { return false }
         let wired = wiredTargets(id)
@@ -409,7 +419,18 @@ extension AudioController {
     }
     private func effectiveGain(_ id: String) -> Double {
         let setting = appSettings[id] ?? .unchanged
-        return soundMuted || setting.muted ? 0 : setting.gain
+        return soundMuted || setting.muted || silencedByPatchbay(id) ? 0 : setting.gain
+    }
+    /// In patchbay mode, an app on the board without any wire plays nowhere. An app whose wired output is merely
+    /// disconnected still falls back to the default output, so a Bluetooth speaker turning off doesn't silence it.
+    private func silencedByPatchbay(_ id: String) -> Bool {
+        guard patchbayMode, suiteEnabled, id != AppSource.systemSoundsID else { return false }
+        return boardAppIDs.contains(id) && (appSettings[id]?.outputs ?? []).isEmpty
+    }
+    /// Apps placed on the Suite's board, which the board stores in the standard defaults.
+    private var boardAppIDs: Set<String> {
+        let board = UserDefaults.standard.dictionary(forKey: "suiteBoard") ?? [:]
+        return Set(board.keys.filter { $0.hasPrefix("app:") }.map { String($0.dropFirst(4)) })
     }
     private func applyRouteGains() {
         for (key, route) in routes { route.setGain(effectiveGain(key.source)) }
@@ -791,6 +812,28 @@ extension AudioController {
         return wired.map(\.uid) == [defaultOutput.uid] ? [] : wired
     }
 
+    /// Whether patchbay mode keeps this app silent, for the panel and the Suite.
+    func isSilencedByPatchbay(_ app: AppSource) -> Bool { mixingEnabled && silencedByPatchbay(app.id) }
+
+    /// Called when apps are placed on or removed from the board, which matters in patchbay mode.
+    func boardChanged() {
+        objectWillChange.send()
+        updateRoutes(live: Set(HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList)), now: Date())
+    }
+
+    /// The ids of apps recording from an input right now.
+    func appIDsUsing(input: AudioSource) -> [String] {
+        let running = NSWorkspace.shared.runningApplications
+        var ids: [String] = []
+        for process in HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList) {
+            guard HAL.read(process, kAudioProcessPropertyIsRunningInput, initial: UInt32(0)) == 1,
+                  let pid = HAL.read(process, kAudioProcessPropertyPID, initial: pid_t(0)), pid != getpid(),
+                  HAL.ids(process, kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeInput).contains(input.device) else { continue }
+            if case .app(let key, _, _) = AudioOwner(pid: pid, processObject: process, running: running), !ids.contains(key) { ids.append(key) }
+        }
+        return ids
+    }
+
     /// The apps recording from an input right now, by name.
     func appsUsing(input: AudioSource) -> [String] {
         let running = NSWorkspace.shared.runningApplications
@@ -949,20 +992,21 @@ extension AudioController {
 // MARK: Sync and output mute
 
 extension AudioController {
-    /// How long an output takes to play a sample, in seconds, as the device reports it, plus the user's offset.
+    /// How long an output takes to play a sample, in seconds, as the device reports it. The user's sync offset is
+    /// extra delay for that output, so it counts as the output being that much faster.
     func outputLatency(_ uid: String) -> Double {
         let offset = (syncOffsets[uid] ?? 0) / 1000
-        guard let output = sources.first(where: { !$0.input && $0.uid == uid }) else { return offset }
+        guard let output = sources.first(where: { !$0.input && $0.uid == uid }) else { return -offset }
         let device = output.device
         let rate = HAL.read(device, kAudioDevicePropertyNominalSampleRate, initial: Float64(0)) ?? 0
-        guard rate > 0 else { return offset }
+        guard rate > 0 else { return -offset }
         var frames = scalar(device, address(kAudioDevicePropertyLatency), initial: UInt32(0)) ?? 0
         frames += scalar(device, address(kAudioDevicePropertySafetyOffset), initial: UInt32(0)) ?? 0
         frames += HAL.read(device, kAudioDevicePropertyBufferFrameSize, initial: UInt32(0)) ?? 0
         if let stream = HAL.ids(device, kAudioDevicePropertyStreams, scope: kAudioDevicePropertyScopeOutput).first {
             frames += HAL.read(stream, kAudioStreamPropertyLatency, initial: UInt32(0)) ?? 0
         }
-        return Double(frames) / rate + offset
+        return Double(frames) / rate - offset
     }
 
     func syncOffset(_ output: AudioSource) -> Double { syncOffsets[output.uid] ?? 0 }
