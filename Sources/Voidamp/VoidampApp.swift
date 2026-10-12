@@ -76,13 +76,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 let audio = VoidampRuntime.shared.audio
                 let symbol = audio.statusSymbol
                 if self?.statusItem?.button?.image?.accessibilityDescription != symbol {
-                    let image = NSImage(systemSymbolName: symbol, accessibilityDescription: symbol)
-                    image?.isTemplate = true
-                    self?.statusItem?.button?.image = image
+                    self?.statusItem?.button?.image = Self.statusIcon(symbol)
                     self?.statusItem?.button?.setAccessibilityLabel("Voidamp")
                 }
                 self?.statusItem?.button?.toolTip = "Voidamp · \(audio.statusDescription)"
             }
+    }
+
+    private static let statusSymbols = ["speaker.slash.fill", "speaker.fill", "speaker.wave.1.fill", "speaker.wave.2.fill", "speaker.wave.3.fill", "headphones"]
+    /// Every icon state is drawn on one canvas the size of the largest symbol. The symbols differ in size, and when
+    /// the status item's image changed size macOS re-anchored the open panel, moving it 4 pt whenever sound was muted.
+    private static let iconCanvas: NSSize = statusSymbols
+        .compactMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil)?.size }
+        .reduce(NSSize.zero) { NSSize(width: max($0.width, ceil($1.width)), height: max($0.height, ceil($1.height))) }
+
+    private static func statusIcon(_ symbol: String) -> NSImage? {
+        guard let glyph = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) else { return nil }
+        let canvas = iconCanvas
+        let image = NSImage(size: canvas, flipped: false) { _ in
+            // Whole-point origins keep the glyph crisp.
+            let origin = NSPoint(x: ((canvas.width - glyph.size.width) / 2).rounded(), y: ((canvas.height - glyph.size.height) / 2).rounded())
+            glyph.draw(in: NSRect(origin: origin, size: glyph.size))
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = symbol
+        return image
     }
 
     private func statusItemContains(_ location: NSPoint) -> Bool {
