@@ -344,12 +344,12 @@ private struct SuiteSidebar: View {
                 .help("Mix and route application audio")
             HStack(spacing: 8) {
                 Button { audio.toggleSoundMute() } label: {
-                    Label("Sound", systemImage: audio.soundMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    Label("Sound", systemImage: audio.soundMuted ? "speaker.slash.fill" : "speaker.wave.2")
                         .frame(maxWidth: .infinity)
                 }
                 .help(audio.soundMuted ? "Unmute sound" : "Mute sound")
                 Button { audio.toggleMicMute() } label: {
-                    Label("Mic", systemImage: audio.micMuted ? "mic.slash.fill" : "mic.fill")
+                    Label("Mic", systemImage: audio.micMuted ? "mic.slash.fill" : "mic")
                         .frame(maxWidth: .infinity)
                 }
                 .help(audio.micMuted ? "Unmute microphones" : "Mute microphones")

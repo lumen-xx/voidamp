@@ -47,12 +47,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var outsideClickMonitor: Any?
     private var keyMonitor: Any?
     private var lastClose = Date.distantPast
+    private var previewWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
         // `--overlay-snapshot <png> [--light]` renders the volume overlay card for review and quits.
         if let index = CommandLine.arguments.firstIndex(of: "--overlay-snapshot"), CommandLine.arguments.indices.contains(index + 1) {
             OverlaySnapshot.render(to: CommandLine.arguments[index + 1], dark: !CommandLine.arguments.contains("--light"))
+            return
+        }
+        // `--panel-preview [--muted] [--light]` shows the menu bar panel in a window for screenshots and prints its
+        // window number. --muted shows Sound and Mic as muted without muting any device.
+        if CommandLine.arguments.contains("--panel-preview") {
+            let suite = "app.voidamp.preview.\(UUID().uuidString)"
+            let audio = AudioController(preferences: UserDefaults(suiteName: suite)!, autoStartMixing: false)
+            // Stop the controller's refresh first: with the flags set, it would mute every real device.
+            audio.shutDown()
+            if CommandLine.arguments.contains("--muted") { audio.soundMuted = true; audio.micMuted = true }
+            let runtime = VoidampRuntime.shared
+            let host = NSHostingView(rootView: MixerView(audio: audio, updater: runtime.updater, loginItem: runtime.loginItem).padding(20))
+            host.frame.size = host.fittingSize
+            let window = NSPanel(contentRect: host.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            window.isOpaque = false; window.backgroundColor = .clear; window.level = .floating
+            window.appearance = NSAppearance(named: CommandLine.arguments.contains("--light") ? .aqua : .darkAqua)
+            window.contentView = host
+            window.setFrameOrigin(NSPoint(x: 200, y: 300)); window.orderFrontRegardless()
+            previewWindow = window
+            print("window \(window.windowNumber)"); fflush(stdout)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) { exit(0) }
             return
         }
         // `--suite-preview` opens only the Suite, for screenshots, and prints its window number.
@@ -450,13 +472,19 @@ struct MixerView: View {
         audio.saveProfile(name: profileName)
         savingProfile = false
     }
+    /// Muted shows a grey capsule like the Suite's sidebar buttons, as tall as the Profiles island; unmuted is a plain label.
+    @ViewBuilder
     private func muteButton(_ label: String, icon: String, active: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            muteLabel(label, icon: icon)
-                .foregroundStyle(active ? Color.white : Color.primary)
-                .modifier(MuteControlSurface(active: active))
+        Group {
+            if active {
+                // The same 30 pt capsule as the Profiles and More island beside it.
+                Button(action: action) { muteLabel(label, icon: icon).modifier(ToolbarIslandSurface()) }
+                    .buttonStyle(.plain)
+            } else {
+                Button(action: action) { muteLabel(label, icon: icon) }
+                    .buttonStyle(.plain)
+            }
         }
-        .buttonStyle(.plain)
         .frame(maxWidth: .infinity)
         .frame(height: 30)
         .help(active ? "Unmute \(label.lowercased())" : "Mute \(label.lowercased())")
@@ -692,19 +720,6 @@ private struct ToolbarIslandSurface: ViewModifier {
             content.background(.regularMaterial, in: Capsule())
                 .overlay(Capsule().strokeBorder(.primary.opacity(0.08)))
         }
-    }
-}
-
-private struct MuteControlSurface: ViewModifier {
-    let active: Bool
-    func body(content: Content) -> some View {
-        if active {
-            if #available(macOS 26.0, *) {
-                content.glassEffect(.regular.tint(.red).interactive(), in: .capsule)
-            } else {
-                content.background(Color.red, in: Capsule())
-            }
-        } else { content }
     }
 }
 
