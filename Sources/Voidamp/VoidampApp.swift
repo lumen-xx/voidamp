@@ -8,6 +8,8 @@ final class VoidampRuntime: ObservableObject {
     let audio = AudioController()
     let updater = AppUpdater()
     let loginItem = LoginItem()
+    /// Set once the menu bar icon exists.
+    var overlay: ControlOverlay?
 
     /// The More menu, shared by the panel's ellipsis button and a right-click on the menu bar icon.
     func moreMenu() -> NSMenu {
@@ -17,6 +19,14 @@ final class VoidampRuntime: ObservableObject {
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem("Show System Sounds in Mixing", checked: audio.showSystemSounds) { [audio] in audio.showSystemSounds.toggle() })
         menu.addItem(ClosureMenuItem("Start at Login", checked: loginItem.enabled) { [loginItem] in loginItem.setEnabled(!loginItem.enabled) })
+        if let overlay {
+            menu.addItem(ClosureMenuItem("Volume & Brightness Overlay", checked: overlay.enabled) { overlay.enabled.toggle() })
+            if overlay.enabled && !overlay.trusted {
+                menu.addItem(ClosureMenuItem("Allow Accessibility for the Overlay…") {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                })
+            }
+        }
         if loginItem.needsApproval {
             menu.addItem(ClosureMenuItem("Approve Start at Login…") { [loginItem] in loginItem.openSettings() })
         }
@@ -38,6 +48,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
+        // `--overlay-snapshot <png> [--light]` renders the volume overlay card for review and quits.
+        if let index = CommandLine.arguments.firstIndex(of: "--overlay-snapshot"), CommandLine.arguments.indices.contains(index + 1) {
+            OverlaySnapshot.render(to: CommandLine.arguments[index + 1], dark: !CommandLine.arguments.contains("--light"))
+            return
+        }
         if CommandLine.arguments.contains("--updater-check") {
             let updater = VoidampRuntime.shared.updater
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
@@ -51,6 +66,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         configureStatusItem()
+        let overlay = ControlOverlay(audio: VoidampRuntime.shared.audio, panelShown: { [weak self] in self?.popover.isShown ?? false })
+        VoidampRuntime.shared.overlay = overlay
+        overlay.start()
     }
 
     private func configureStatusItem() {
@@ -228,6 +246,10 @@ struct VoidampApp: App {
             precondition(MixerGain.adjusted(1.2, snapping: true) == 1.2)
             precondition(MixerGain.adjusted(1.02, snapping: false) == 1.02)
             precondition(MixerGain.adjusted(3, snapping: false) == 2)
+            // Overlay keys step like the system: 16 steps, 64 with Option-Shift, snapping onto the grid and clamped.
+            precondition(ControlOverlay.step(0.5, up: true, steps: 16) == 0.5625 && ControlOverlay.step(0.5, up: false, steps: 16) == 0.4375)
+            precondition(ControlOverlay.step(0.51, up: true, steps: 16) == 0.5625 && ControlOverlay.step(1, up: true, steps: 16) == 1 && ControlOverlay.step(0, up: false, steps: 16) == 0)
+            precondition(ControlOverlay.step(0.5, up: true, steps: 64) == 0.515625)
             precondition(MixerGain.adjusted(-1, snapping: false) == 0)
             precondition(controller.apps.contains(where: \.isSystem), "System Sounds row missing")
             controller.showSystemSounds = false
