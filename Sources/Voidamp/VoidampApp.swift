@@ -117,7 +117,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var outsideClickMonitor: Any?
     private var keyMonitor: Any?
     private var lastClose = Date.distantPast
-    private var keepActiveOnClose = false
     private var previewWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -171,12 +170,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         configureStatusItem()
-        // Closing the panel to open something else keeps Voidamp in front.
-        VoidampRuntime.shared.closePanel = { [weak self] in
-            self?.keepActiveOnClose = true
-            self?.closePanel()
-            self?.keepActiveOnClose = false
-        }
+        VoidampRuntime.shared.closePanel = { [weak self] in self?.closePanel() }
         let overlay = ControlOverlay(audio: VoidampRuntime.shared.audio, panelShown: { [weak self] in self?.popover.isShown ?? false })
         VoidampRuntime.shared.overlay = overlay
         overlay.start()
@@ -271,7 +265,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard Date().timeIntervalSince(lastClose) > 0.35 else { return }
         guard let button = statusItem?.button, let host = popover.contentViewController else { return }
         // Become the active app before anything in the panel is clicked. Otherwise that first click
-        // activates Voidamp, and the activation dismisses the menu it just opened.
+        // activates Voidamp, and the activation dismisses the menu it just opened. Clear a hidden state left by
+        // earlier versions first, for the same reason.
+        if NSApplication.shared.isHidden { NSApplication.shared.unhideWithoutActivation() }
         NSApplication.shared.activate(ignoringOtherApps: true)
         host.view.layoutSubtreeIfNeeded()
         popover.contentSize = host.view.fittingSize
@@ -297,8 +293,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func popoverDidClose(_ notification: Notification) {
         lastClose = Date()
         statusItem?.button?.highlight(false)
-        // Hand the keyboard back to the app that was in front, unless the panel closed to open something of Voidamp's.
-        if !keepActiveOnClose, !SuiteWindowController.shared.isOpen { NSApplication.shared.hide(nil) }
+        // Voidamp doesn't hide or deactivate itself here: both happen asynchronously, and when they landed after the
+        // panel had been opened again they closed it at once, as if focus had moved away.
     }
 
     /// Opening Voidamp again (for example when its icon is hidden behind the notch) opens the Suite.
