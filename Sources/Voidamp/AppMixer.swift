@@ -41,6 +41,8 @@ enum Responsibility {
 
 struct AppSource: Identifiable, Equatable {
     static let systemSoundsID = "app.voidamp.system-sounds"
+    /// Apps that only play alert sounds; their audio counts as System Sounds.
+    static let alertAppIDs: Set<String> = ["com.apple.finder", "com.apple.mail"]
     let id: String
     let name: String
     let icon: NSImage?

@@ -10,11 +10,21 @@ final class VoidampRuntime: ObservableObject {
     let loginItem = LoginItem()
     /// Set once the menu bar icon exists.
     var overlay: ControlOverlay?
+    /// Closes the menu bar panel; set by the app delegate.
+    var closePanel: () -> Void = {}
+
+    func openSuite() {
+        closePanel()
+        SuiteWindowController.shared.show()
+    }
 
     /// The More menu, shared by the panel's ellipsis button and a right-click on the menu bar icon.
     func moreMenu() -> NSMenu {
         let menu = NSMenu()
-        menu.addItem(ClosureMenuItem("Open Voidamp Suite…") { SuiteWindowController.shared.show() })
+        menu.addItem(ClosureMenuItem("Open Voidamp Suite…") { [weak self] in self?.openSuite() })
+        let profiles = NSMenuItem(title: "Profiles", action: nil, keyEquivalent: "")
+        profiles.submenu = profilesMenu()
+        menu.addItem(profiles)
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem("Check for Updates…", enabled: updater.canCheckForUpdates) { [updater] in updater.checkForUpdates() })
         menu.addItem(ClosureMenuItem("Refresh sources") { [audio] in audio.refresh() })
@@ -35,6 +45,42 @@ final class VoidampRuntime: ObservableObject {
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem("Quit Voidamp") { [audio] in audio.shutDown(); NSApplication.shared.terminate(nil) })
         return menu
+    }
+
+    /// Saved setups of devices, levels, mutes and the Suite's app wiring.
+    private func profilesMenu() -> NSMenu {
+        let menu = NSMenu()
+        if audio.profiles.isEmpty {
+            menu.addItem(ClosureMenuItem("No saved profiles", enabled: false) {})
+        } else {
+            for profile in audio.profiles {
+                let selected = audio.selectedProfile == profile.id
+                menu.addItem(ClosureMenuItem(profile.name, checked: selected) { [audio] in
+                    if selected { audio.selectedProfile = nil } else { audio.applyProfile(profile) }
+                })
+            }
+        }
+        menu.addItem(.separator())
+        menu.addItem(ClosureMenuItem("Save Current as Profile…") { [weak self] in self?.askToSaveProfile() })
+        if let id = audio.selectedProfile, let name = audio.profiles.first(where: { $0.id == id })?.name {
+            menu.addItem(ClosureMenuItem("Delete “\(name)”") { [audio] in audio.deleteProfile(id) })
+        }
+        return menu
+    }
+
+    private func askToSaveProfile() {
+        closePanel()
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Save Profile"
+        alert.informativeText = "Saves the current devices, levels, mutes and the Suite’s app wiring."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.placeholderString = "Profile name"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        if alert.runModal() == .alertFirstButtonReturn { audio.saveProfile(name: field.stringValue) }
     }
 }
 
@@ -96,6 +142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         configureStatusItem()
+        VoidampRuntime.shared.closePanel = { [weak self] in self?.closePanel() }
         let overlay = ControlOverlay(audio: VoidampRuntime.shared.audio, panelShown: { [weak self] in self?.popover.isShown ?? false })
         VoidampRuntime.shared.overlay = overlay
         overlay.start()
@@ -249,7 +296,9 @@ struct VoidampApp: App {
             // Untouched apps play directly; a level other than 100% makes each playing app use a route.
             // `--route-to <name>` wires each playing app to that output instead.
             let targetName = CommandLine.arguments.firstIndex(of: "--route-to").flatMap { CommandLine.arguments.indices.contains($0 + 1) ? CommandLine.arguments[$0 + 1] : nil }
-            for app in controller.apps where app.isPlaying {
+            // `--only <name>` limits the check to one app, so other apps' audio is left alone.
+            let only = CommandLine.arguments.firstIndex(of: "--only").flatMap { CommandLine.arguments.indices.contains($0 + 1) ? CommandLine.arguments[$0 + 1] : nil }
+            for app in controller.apps where app.isPlaying && (only.map { app.name.localizedCaseInsensitiveContains($0) } ?? true) {
                 // System Sounds move with macOS's alert device; the check never changes that setting.
                 if let targetName, !app.isSystem, let output = controller.sources.first(where: { !$0.input && $0.name.localizedCaseInsensitiveContains(targetName) }) {
                     controller.connect(app, to: output)
@@ -329,8 +378,6 @@ struct MixerView: View {
     @State private var devicesExpanded = false
     @State private var renamingDevice: AudioSource?
     @State private var deviceName = ""
-    @State private var savingProfile = false
-    @State private var profileName = ""
     @State private var measuredContentHeight: CGFloat = 1
     @State private var draggingApps: Set<String> = []
     private let accent = Color.accentColor
@@ -339,22 +386,22 @@ struct MixerView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
                 muteButton("Sound", icon: audio.soundMuted ? "speaker.slash.fill" : "speaker.wave.2", active: audio.soundMuted) { audio.toggleSoundMute() }
-                muteButton("Mic", icon: audio.micMuted ? "mic.slash.fill" : "mic", active: audio.micMuted) { audio.toggleMicMute() }
+                muteButton("Mic", icon: audio.micMuted ? "mic.slash.fill" : "mic", active: audio.micMuted, badge: audio.monitoringActive && !audio.micMuted) { audio.toggleMicMute() }
                 HStack(spacing: 8) {
                     // AppKit menus instead of SwiftUI's Menu: they open only once Voidamp is the active app,
                     // so the activation from a first click can't dismiss them a moment after they appear.
-                    HStack(spacing: 5) {
-                        Image(systemName: audio.selectedProfile == nil ? "square.stack" : "square.stack.fill")
-                        Text(selectedProfileName ?? "Profiles").lineLimit(1).truncationMode(.tail)
-                        Image(systemName: "chevron.down").font(.system(size: 9, weight: .medium))
+                    Button { VoidampRuntime.shared.openSuite() } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "point.3.connected.trianglepath.dotted")
+                            Text("Suite")
+                        }
+                        .font(MixerStyle.caption)
+                        .frame(maxWidth: .infinity, minHeight: 30)
+                        .contentShape(Rectangle())
                     }
-                    .font(MixerStyle.caption)
-                    .foregroundStyle(audio.selectedProfile == nil ? Color.secondary : Color.accentColor)
-                    .frame(maxWidth: .infinity, minHeight: 30)
-                    .contentShape(Rectangle())
-                    .accessibilityHidden(true)
-                    .overlay(PopUpMenuButton(label: selectedProfileName.map { "Profiles, \($0) selected" } ?? "Profiles", makeMenu: profilesMenu))
-                    .help(selectedProfileName.map { "Selected profile: \($0)" } ?? "Profiles")
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Open the Voidamp Suite to wire apps and microphones to outputs")
                     HStack(spacing: 3) {
                         Image(systemName: "ellipsis")
                         Image(systemName: "chevron.down").font(.system(size: 9, weight: .medium))
@@ -371,14 +418,6 @@ struct MixerView: View {
                 .modifier(ToolbarIslandSurface())
             }
             .frame(height: 30)
-            if savingProfile {
-                HStack(spacing: 8) {
-                    TextField("Profile name", text: $profileName).textFieldStyle(.roundedBorder)
-                        .onSubmit { saveProfile() }
-                    Button("Save") { saveProfile() }.disabled(profileName.trimmingCharacters(in: .whitespaces).isEmpty)
-                    Button { savingProfile = false } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
-                }.font(MixerStyle.body)
-            }
             Divider()
             SoundLevelSlider(value: Binding(get: {
                 selectedOutput.map { audio.displayVolume($0) } ?? 0
@@ -397,7 +436,7 @@ struct MixerView: View {
                         }))
                         .toggleStyle(.switch).controlSize(.mini).fixedSize()
                         .font(MixerStyle.caption)
-                        .help("Mix application audio · up to 200%")
+                        .help("Mix application audio · up to 200%. Off also pauses the Suite’s wires.")
                     }
                     if !audio.apps.contains(where: { !$0.isSystem }) {
                         Text("Play audio in an app to see it here.").font(MixerStyle.body).foregroundStyle(.secondary).padding(.vertical, 4)
@@ -464,25 +503,19 @@ struct MixerView: View {
         audio.sources.first { !$0.input && $0.isDefault }
     }
 
-    private var selectedProfileName: String? {
-        audio.profiles.first(where: { $0.id == audio.selectedProfile })?.name
-    }
-
-    private func saveProfile() {
-        audio.saveProfile(name: profileName)
-        savingProfile = false
-    }
     /// Muted shows a grey capsule like the Suite's sidebar buttons, as tall as the Profiles island; unmuted is a plain label.
     @ViewBuilder
-    private func muteButton(_ label: String, icon: String, active: Bool, action: @escaping () -> Void) -> some View {
+    /// `badge` marks the Mic button while a microphone is played on an output, so monitoring isn't forgotten.
+    private func muteButton(_ label: String, icon: String, active: Bool, badge: Bool = false, action: @escaping () -> Void) -> some View {
         Group {
             if active {
                 // The same 30 pt capsule as the Profiles and More island beside it.
                 Button(action: action) { muteLabel(label, icon: icon).modifier(ToolbarIslandSurface()) }
                     .buttonStyle(.plain)
             } else {
-                Button(action: action) { muteLabel(label, icon: icon) }
+                Button(action: action) { muteLabel(label, icon: icon, badge: badge) }
                     .buttonStyle(.plain)
+                    .help(badge ? "You’re hearing a microphone through the Suite" : "")
             }
         }
         .frame(maxWidth: .infinity)
@@ -491,9 +524,12 @@ struct MixerView: View {
         .accessibilityLabel(active ? "Unmute \(label.lowercased())" : "Mute \(label.lowercased())")
         .accessibilityValue(active ? "Muted" : "Unmuted")
     }
-    private func muteLabel(_ label: String, icon: String) -> some View {
+    private func muteLabel(_ label: String, icon: String, badge: Bool = false) -> some View {
         HStack(spacing: 6) {
             Image(systemName: icon).frame(width: 15)
+                .overlay(alignment: .topTrailing) {
+                    if badge { Circle().fill(Color.orange).frame(width: 5, height: 5).offset(x: 3, y: -1) }
+                }
             Text(label)
         }
         .font(MixerStyle.caption)
@@ -511,6 +547,18 @@ struct MixerView: View {
                 else { Image(systemName: app.isSystem ? "bell.fill" : "app.dashed").font(.system(size: 11)).foregroundStyle(.secondary) }
             }.frame(width: 16, height: 16)
             Text(app.name).font(MixerStyle.body).lineLimit(1).frame(width: 80, alignment: .leading).help(app.name)
+            // Only apps the Suite sends somewhere other than the default output show where they play.
+            let routed = audio.routedOutputs(app)
+            if !routed.isEmpty {
+                HStack(spacing: 1) {
+                    Image(systemName: deviceSymbol(routed[0]))
+                    if routed.count > 1 { Text("\(routed.count)").monospacedDigit() }
+                }
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .help("Plays on " + routed.map { audio.displayName($0) }.joined(separator: " and "))
+                .accessibilityLabel("Plays on " + routed.map { audio.displayName($0) }.joined(separator: " and "))
+            }
             Slider(value: Binding(get: { audio.apps.first(where: { $0.id == app.id })?.gain ?? app.gain }, set: { audio.setAppGain(app, $0, snapping: draggingApps.contains(app.id)) }), in: 0...2, onEditingChanged: { editing in
                     if editing { draggingApps.insert(app.id) } else { draggingApps.remove(app.id) }
                 })
@@ -572,28 +620,6 @@ struct MixerView: View {
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.orange.opacity(0.1)))
-    }
-
-    private func profilesMenu() -> NSMenu {
-        let menu = NSMenu()
-        if audio.profiles.isEmpty {
-            menu.addItem(ClosureMenuItem("No saved profiles", enabled: false) {})
-        } else {
-            for profile in audio.profiles {
-                let selected = audio.selectedProfile == profile.id
-                menu.addItem(ClosureMenuItem(profile.name, checked: selected) { [audio] in
-                    if selected { audio.selectedProfile = nil } else { audio.applyProfile(profile) }
-                })
-            }
-        }
-        menu.addItem(.separator())
-        menu.addItem(ClosureMenuItem("Save current as profile…") { profileName = ""; savingProfile = true })
-        if let id = audio.selectedProfile {
-            menu.addItem(ClosureMenuItem("Delete selected profile") { [audio] in audio.deleteProfile(id) })
-        }
-        menu.addItem(.separator())
-        menu.addItem(ClosureMenuItem("Clear current profile", enabled: audio.selectedProfile != nil) { [audio] in audio.selectedProfile = nil })
-        return menu
     }
 
     private func deviceSymbol(_ source: AudioSource) -> String {

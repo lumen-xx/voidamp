@@ -44,6 +44,15 @@ final class AudioController: ObservableObject {
     @Published private(set) var monitorGains: [String: Double] = [:]
     /// Why an input couldn't be monitored, by input UID.
     @Published private(set) var monitorFailures: [String: String] = [:]
+    /// The Suite's master switch. Off, every app plays on the default output and monitoring stops; the wiring is kept.
+    @Published var suiteEnabled: Bool {
+        didSet {
+            guard suiteEnabled != oldValue else { return }
+            preferences.set(suiteEnabled, forKey: "suiteEnabled")
+            updateRoutes(live: Set(HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList)), now: Date())
+            updateMonitors()
+        }
+    }
     private var appSettings: [String: AppSetting] = [:]
     private var nativeMuteStates: [String: UInt32] = [:]
     private var mutedDevices: [String: Double] = [:]
@@ -63,6 +72,7 @@ final class AudioController: ObservableObject {
         self.deviceNames = preferences.dictionary(forKey: "deviceNames") as? [String: String] ?? [:]
         self.mixingEnabled = autoStartMixing
         self.showSystemSounds = preferences.object(forKey: "showSystemSounds") as? Bool ?? true
+        self.suiteEnabled = preferences.object(forKey: "suiteEnabled") as? Bool ?? true
         if let data = preferences.data(forKey: "profiles"), let stored = try? JSONDecoder().decode([MixerProfile].self, from: data) { profiles = stored }
         if let data = preferences.data(forKey: "appSettings"), let stored = try? JSONDecoder().decode([String: AppSetting].self, from: data) { appSettings = stored }
         monitorWiring = preferences.dictionary(forKey: "monitorWiring") as? [String: [String]] ?? [:]
@@ -368,15 +378,31 @@ extension AudioController {
         if setting.muted || abs(setting.gain - 1) > 0.001 { return true }
         // Wired elsewhere than the default output. System Sounds move with macOS's alert device instead.
         guard id != AppSource.systemSoundsID, let defaultOutput = defaultOutputSource else { return false }
-        return routeTargets(id, defaultOutput: defaultOutput).map(\.uid) != [defaultOutput.uid]
+        let wired = wiredTargets(id)
+        return !wired.isEmpty && wired.map(\.uid) != [defaultOutput.uid]
+    }
+    /// The Suite's wires from an app to outputs that are present, while the Suite is on.
+    private func wiredTargets(_ id: String) -> [AudioSource] {
+        guard suiteEnabled else { return [] }
+        return (appSettings[id]?.outputs ?? []).compactMap { uid in sources.first { !$0.input && $0.uid == uid } }
+    }
+    /// The output an app plays on by its own choice, such as Discord or a music app with its own device setting.
+    private func ownOutput(_ id: String) -> AudioSource? {
+        guard let app = apps.first(where: { $0.id == id }) else { return nil }
+        for process in app.processes {
+            for device in HAL.ids(process, kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeOutput) {
+                if let source = sources.first(where: { !$0.input && $0.device == device }) { return source }
+            }
+        }
+        return nil
     }
     private var defaultOutputSource: AudioSource? { sources.first { !$0.input && $0.isDefault } }
-    /// Where an app plays: the connected outputs that are present, or the default output. System Sounds play on
-    /// macOS's alert device.
+    /// Where an app plays: its wires that are present, otherwise the output the app chose itself or the default
+    /// output. System Sounds play on macOS's alert device.
     private func routeTargets(_ id: String, defaultOutput: AudioSource) -> [AudioSource] {
         if id == AppSource.systemSoundsID { return [alertOutput ?? defaultOutput] }
-        let wired = (appSettings[id]?.outputs ?? []).compactMap { uid in sources.first { !$0.input && $0.uid == uid } }
-        return wired.isEmpty ? [defaultOutput] : wired
+        let wired = wiredTargets(id)
+        return wired.isEmpty ? [ownOutput(id) ?? defaultOutput] : wired
     }
     private func effectiveGain(_ id: String) -> Double {
         let setting = appSettings[id] ?? .unchanged
@@ -574,7 +600,10 @@ private enum AudioOwner {
 
     init(pid: pid_t, processObject: AudioObjectID, running: [NSRunningApplication]) {
         let process = NSRunningApplication(processIdentifier: pid)
-        if let owner = Responsibility.app(for: pid), Self.isUserApp(owner) { self = .init(owner); return }
+        let owner = Responsibility.app(for: pid)
+        // Finder and Mail only play alert sounds; they belong with System Sounds.
+        if let id = (owner ?? process)?.bundleIdentifier, AppSource.alertAppIDs.contains(id) { self = .system; return }
+        if let owner, Self.isUserApp(owner) { self = .init(owner); return }
         if let process, Self.isUserApp(process) { self = .init(process); return }
         // Helpers inside an app bundle, or named after its bundle identifier.
         let bundle = HAL.string(processObject, kAudioProcessPropertyBundleID) ?? process?.bundleIdentifier ?? ""
@@ -685,7 +714,6 @@ extension AudioController {
         guard !outputs.contains(output.uid) else { return }
         // The first wire replaces the implicit default.
         outputs.append(output.uid)
-        if !mixingEnabled { enableMixing() }
         // Routing needs a capture even for apps that can't be mixed yet; give them another chance.
         if routeFailures[app.id] != nil { failedProcesses.removeValue(forKey: app.id); routeFailures.removeValue(forKey: app.id) }
         changeOutputs(app, outputs)
@@ -698,6 +726,70 @@ extension AudioController {
             return
         }
         changeOutputs(app, (appSettings[app.id]?.outputs ?? []).filter { $0 != outputUID })
+    }
+
+    /// Removes every wire from an app; System Sounds go back to the default output.
+    func clearWiring(_ app: AppSource) {
+        if app.isSystem {
+            if let output = defaultOutputSource, alertOutput?.uid != output.uid { setAlertOutput(output) }
+            return
+        }
+        if !(appSettings[app.id]?.outputs ?? []).isEmpty { changeOutputs(app, []) }
+    }
+
+    /// Removes every wire into an output, from apps and inputs alike.
+    func clearWiring(output uid: String) {
+        let wired = appSettings.filter { $0.value.outputs.contains(uid) }
+        for (id, var setting) in wired {
+            setting.outputs.removeAll { $0 == uid }
+            appSettings[id] = setting
+        }
+        if !wired.isEmpty {
+            persistAppSettings()
+            objectWillChange.send()
+            updateRoutes(live: Set(HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList)), now: Date())
+        }
+        if alertOutput?.uid == uid, let output = defaultOutputSource, output.uid != uid { setAlertOutput(output) }
+        for (input, outputs) in monitorWiring where outputs.contains(uid) {
+            monitorWiring[input] = outputs.filter { $0 != uid }
+            if monitorWiring[input]?.isEmpty == true { monitorWiring.removeValue(forKey: input) }
+        }
+        persistMonitors()
+        updateMonitors()
+    }
+
+    /// Where an app plays when that isn't simply the default output, for the menu bar panel. Empty while mixing or
+    /// the Suite is off, since wires are paused then.
+    func routedOutputs(_ app: AppSource) -> [AudioSource] {
+        guard let defaultOutput = defaultOutputSource else { return [] }
+        if app.isSystem {
+            guard let alert = alertOutput, alert.uid != defaultOutput.uid else { return [] }
+            return [alert]
+        }
+        guard mixingEnabled else { return [] }
+        let wired = wiredTargets(app.id)
+        return wired.map(\.uid) == [defaultOutput.uid] ? [] : wired
+    }
+
+    /// The apps recording from an input right now, by name.
+    func appsUsing(input: AudioSource) -> [String] {
+        let running = NSWorkspace.shared.runningApplications
+        var names: [String] = []
+        for process in HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList) {
+            guard HAL.read(process, kAudioProcessPropertyIsRunningInput, initial: UInt32(0)) == 1,
+                  let pid = HAL.read(process, kAudioProcessPropertyPID, initial: pid_t(0)), pid != getpid(),
+                  HAL.ids(process, kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeInput).contains(input.device) else { continue }
+            if case .app(_, let name, _) = AudioOwner(pid: pid, processObject: process, running: running), !names.contains(name) { names.append(name) }
+        }
+        return names.sorted()
+    }
+
+    /// Whether a microphone is being played on an output, so the panel can show that you hear yourself.
+    var monitoringActive: Bool {
+        guard suiteEnabled else { return false }
+        return monitorWiring.contains { input, outputs in
+            sources.contains { $0.input && $0.uid == input } && outputs.contains { uid in sources.contains { !$0.input && $0.uid == uid } }
+        }
     }
 
     private func changeOutputs(_ app: AppSource, _ outputs: [String]) {
@@ -739,6 +831,12 @@ extension AudioController {
         }
     }
 
+    func clearWiring(input uid: String) {
+        guard monitorWiring.removeValue(forKey: uid) != nil else { return }
+        persistMonitors()
+        updateMonitors()
+    }
+
     func disconnect(input: AudioSource, from outputUID: String) {
         monitorWiring[input.uid] = (monitorWiring[input.uid] ?? []).filter { $0 != outputUID }
         if monitorWiring[input.uid]?.isEmpty == true { monitorWiring.removeValue(forKey: input.uid) }
@@ -764,7 +862,7 @@ extension AudioController {
     /// Starts and stops monitors to match the wiring and the devices present.
     func updateMonitors() {
         var wanted: [RouteKey: (AudioSource, AudioSource)] = [:]
-        for (inputUID, outputUIDs) in monitorWiring {
+        for (inputUID, outputUIDs) in monitorWiring where suiteEnabled {
             guard let input = sources.first(where: { $0.input && $0.uid == inputUID }) else { continue }
             for uid in outputUIDs {
                 if let output = sources.first(where: { !$0.input && $0.uid == uid }) { wanted[RouteKey(source: inputUID, output: uid)] = (input, output) }

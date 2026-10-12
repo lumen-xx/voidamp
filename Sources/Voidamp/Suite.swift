@@ -153,6 +153,22 @@ final class SuiteBoard: ObservableObject {
     }
 }
 
+extension SuiteBoard {
+    /// Takes items off the board and removes their wires: a node you can't see never routes audio.
+    func remove(_ ids: [String], audio: AudioController, catalog: [SuiteItem]) {
+        for id in ids {
+            if let item = catalog.first(where: { $0.id == id }) {
+                switch item.kind {
+                case .app: audio.clearWiring(audio.appSource(id: item.key, name: item.title, icon: item.icon))
+                case .input: audio.clearWiring(input: item.key)
+                case .output: audio.clearWiring(output: item.key)
+                }
+            }
+            remove(id)
+        }
+    }
+}
+
 /// Regular apps that are running, so they can be wired before they play.
 @MainActor
 final class RunningApps: ObservableObject {
@@ -172,7 +188,9 @@ final class RunningApps: ObservableObject {
 
     private func refresh() {
         apps = NSWorkspace.shared.runningApplications.filter {
-            $0.activationPolicy == .regular && $0.bundleIdentifier != nil && $0.bundleIdentifier != "app.voidamp.mac" && $0.processIdentifier != getpid()
+            guard $0.activationPolicy == .regular, let id = $0.bundleIdentifier else { return false }
+            // Finder and Mail only play alerts, which System Sounds covers.
+            return id != "app.voidamp.mac" && !AppSource.alertAppIDs.contains(id) && $0.processIdentifier != getpid()
         }
     }
 }
@@ -256,7 +274,7 @@ struct SuiteView: View {
         }
         let sortedApps = apps.values.sorted {
             let systemA = $0.id == "app:" + AppSource.systemSoundsID, systemB = $1.id == "app:" + AppSource.systemSoundsID
-            if systemA != systemB { return systemB }
+            if systemA != systemB { return systemA }
             if $0.playing != $1.playing { return $0.playing }
             return $0.title.localizedStandardCompare($1.title) == .orderedAscending
         }
@@ -328,7 +346,7 @@ private struct SuiteSidebar: View {
         }
         .contextMenu {
             if onBoard {
-                Button("Remove from Board") { board.remove(item.id) }
+                Button("Remove from Board") { board.remove([item.id], audio: audio, catalog: catalog) }
             } else {
                 Button("Add to Board") { board.place(item, at: board.freeSpot(for: item)) }
             }
@@ -339,9 +357,6 @@ private struct SuiteSidebar: View {
     private var controls: some View {
         VStack(alignment: .leading, spacing: 8) {
             Divider()
-            Toggle("Mixing", isOn: Binding(get: { audio.mixingEnabled }, set: { $0 ? audio.enableMixing() : audio.disableMixing() }))
-                .toggleStyle(.switch).controlSize(.mini)
-                .help("Mix and route application audio")
             HStack(spacing: 8) {
                 Button { audio.toggleSoundMute() } label: {
                     Label("Sound", systemImage: audio.soundMuted ? "speaker.slash.fill" : "speaker.wave.2")
@@ -386,6 +401,7 @@ private struct SuiteCanvas: View {
     @State private var hoveredTarget: String?
     @State private var magnifyStart: CGFloat?
     @State private var dropTargeted = false
+    @State private var selectedNodes: Set<String> = []
 
     var body: some View {
         GeometryReader { geometry in
@@ -398,8 +414,10 @@ private struct SuiteCanvas: View {
                     .gesture(panGesture)
                     .onTapGesture(coordinateSpace: .named("canvas")) { point in
                         selectedWire = hitWire(at: point, wires: wires, frames: frames)
+                        selectedNodes = []
                     }
-                SuiteWires(wires: wires, frames: frames, pending: pendingLine(frames), selected: selectedWire, zoom: board.zoom, meters: meters)
+                SuiteWires(wires: wires, frames: frames, pending: pendingLine(frames), selected: selectedWire, zoom: board.zoom,
+                           paused: !audio.mixingEnabled || !audio.suiteEnabled, meters: meters)
                     .allowsHitTesting(false)
                 ForEach(nodes) { item in
                     if let frame = frames[item.id] {
@@ -424,7 +442,7 @@ private struct SuiteCanvas: View {
             .frame(width: geometry.size.width, height: geometry.size.height)
             .clipped()
             .coordinateSpace(name: "canvas")
-            .background(ScrollWheelZoom { delta, precise, point in
+            .background(CanvasEvents(onKey: handleKey) { delta, precise, point in
                 if precise {
                     // Trackpad scrolling pans; the mouse wheel zooms.
                     board.pan.width += delta.width; board.pan.height += delta.height
@@ -444,6 +462,8 @@ private struct SuiteCanvas: View {
                 drop(ids, at: location)
             } isTargeted: { dropTargeted = $0 }
             .overlay(alignment: .bottomTrailing) { zoomControl(size: geometry.size) }
+            .overlay(alignment: .topTrailing) { suiteSwitch }
+            .overlay(alignment: .top) { pausedNotice }
             .overlay {
                 if dropTargeted {
                     RoundedRectangle(cornerRadius: 12).strokeBorder(Color.accentColor.opacity(0.5), lineWidth: 2).padding(6).allowsHitTesting(false)
@@ -451,11 +471,74 @@ private struct SuiteCanvas: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .onDeleteCommand {
-            let nodes = catalog.filter { board.placed[$0.id] != nil }
+        // The board runs up under the transparent title bar; there is no header.
+        .ignoresSafeArea(.container, edges: .top)
+    }
+
+    /// The Suite's master switch, in the title bar's corner.
+    private var suiteSwitch: some View {
+        Toggle(isOn: $audio.suiteEnabled) {
+            Text("Suite").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+        }
+        .toggleStyle(.switch)
+        .controlSize(.small)
+        .help(audio.suiteEnabled ? "Turn the Suite off: every app plays on the default output and monitoring stops. Your wiring is kept."
+                                 : "Turn the Suite on to use your wiring again")
+        .padding(.top, 14).padding(.trailing, 16)
+    }
+
+    /// Why the wires are dashed: the Suite is off, or mixing is off in the menu bar.
+    @ViewBuilder private var pausedNotice: some View {
+        if !audio.suiteEnabled || !audio.mixingEnabled {
+            HStack(spacing: 8) {
+                Image(systemName: "pause.circle.fill").foregroundStyle(.secondary)
+                Text(audio.suiteEnabled ? "Mixing is off in the menu bar, so wires are paused." : "The Suite is off. Apps play on the default output.")
+                    .font(.system(size: 12))
+                if audio.suiteEnabled {
+                    Button("Turn On Mixing") { audio.enableMixing() }.controlSize(.small)
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .modifier(SuiteNodeSurface(highlighted: false, radius: 12))
+            .padding(.top, 12)
+        }
+    }
+
+    // MARK: Selection and keys
+
+    private func handleKey(_ event: NSEvent) -> Bool {
+        let nodes = catalog.filter { board.placed[$0.id] != nil }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        switch event.keyCode {
+        case 51, 117: // Delete, Forward Delete
+            if !selectedNodes.isEmpty {
+                board.remove(Array(selectedNodes), audio: audio, catalog: catalog)
+                selectedNodes = []; selectedWire = nil
+                return true
+            }
             if let selectedWire, let wire = makeWires(nodes).first(where: { $0.id == selectedWire && !$0.implicit }) {
                 disconnect(wire); self.selectedWire = nil
+                return true
             }
+            return false
+        case 0 where flags.contains(.command) || flags.contains(.control): // A
+            selectedNodes = Set(nodes.map(\.id)); selectedWire = nil
+            return true
+        case 53: // Escape
+            guard !selectedNodes.isEmpty || selectedWire != nil else { return false }
+            selectedNodes = []; selectedWire = nil
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func select(_ id: String) {
+        selectedWire = nil
+        if NSEvent.modifierFlags.contains(.shift) || NSEvent.modifierFlags.contains(.command) {
+            if selectedNodes.contains(id) { selectedNodes.remove(id) } else { selectedNodes.insert(id) }
+        } else {
+            selectedNodes = [id]
         }
     }
 
@@ -494,10 +577,12 @@ private struct SuiteCanvas: View {
         let size = SuiteMetrics.nodeSize
         return nodeContent(item, wires: wires)
             .frame(width: size.width, height: size.height)
-            .modifier(SuiteNodeSurface(highlighted: hoveredTarget == item.id))
+            .modifier(SuiteNodeSurface(highlighted: hoveredTarget == item.id || selectedNodes.contains(item.id)))
             .overlay(alignment: .top) {
                 // The top strip moves the node.
+                // The top strip selects the node on click and moves it on drag.
                 Color.clear.frame(height: 40).contentShape(Rectangle())
+                    .onTapGesture { select(item.id) }
                     .gesture(DragGesture(coordinateSpace: .named("canvas"))
                         .onChanged { nodeDrag = (item.id, $0.translation) }
                         .onEnded { value in
@@ -546,7 +631,11 @@ private struct SuiteCanvas: View {
             Button("Use as Default Microphone") { audio.select(input) }
         }
         Divider()
-        Button("Remove from Board") { board.remove(item.id) }
+        Button(selectedNodes.count > 1 && selectedNodes.contains(item.id) ? "Remove \(selectedNodes.count) Items from Board" : "Remove from Board") {
+            let ids = selectedNodes.contains(item.id) ? Array(selectedNodes) : [item.id]
+            board.remove(ids, audio: audio, catalog: catalog)
+            selectedNodes.subtract(ids)
+        }
     }
 
     // MARK: Geometry
@@ -672,34 +761,47 @@ private struct SuiteCanvas: View {
     }
 }
 
-/// Reports mouse wheel and trackpad scrolling over the board, which SwiftUI doesn't expose on macOS 14.
-private struct ScrollWheelZoom: NSViewRepresentable {
+/// Reports mouse wheel and trackpad scrolling over the board, and key presses in its window, which SwiftUI
+/// doesn't expose reliably on macOS 14.
+private struct CanvasEvents: NSViewRepresentable {
+    let onKey: (NSEvent) -> Bool
     let onScroll: (CGSize, Bool, CGPoint) -> Void
-    func makeNSView(context: Context) -> ScrollWheelView { ScrollWheelView() }
-    func updateNSView(_ view: ScrollWheelView, context: Context) { view.onScroll = onScroll }
+    func makeNSView(context: Context) -> CanvasEventView { CanvasEventView() }
+    func updateNSView(_ view: CanvasEventView, context: Context) { view.onScroll = onScroll; view.onKey = onKey }
 }
 
-private final class ScrollWheelView: NSView {
+private final class CanvasEventView: NSView {
     var onScroll: ((CGSize, Bool, CGPoint) -> Void)?
-    private var monitor: Any?
+    var onKey: ((NSEvent) -> Bool)?
+    private var monitors: [Any] = []
     override var isFlipped: Bool { true }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
+        removeMonitors()
         guard window != nil else { return }
-        // A monitor, because the nodes above this view would otherwise receive the wheel first.
-        monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+        // Monitors, because the nodes above this view would otherwise receive the wheel first.
+        if let monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel, handler: { [weak self] event in
             guard let self, event.window === self.window else { return event }
             let point = self.convert(event.locationInWindow, from: nil)
             guard self.bounds.contains(point) else { return event }
             self.onScroll?(CGSize(width: event.scrollingDeltaX, height: event.scrollingDeltaY), event.hasPreciseScrollingDeltas, point)
             return nil
-        }
+        }) { monitors.append(monitor) }
+        if let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
+            guard let self, event.window === self.window else { return event }
+            // Typing in a text field keeps its keys.
+            if event.window?.firstResponder is NSText { return event }
+            return self.onKey?(event) == true ? nil : event
+        }) { monitors.append(monitor) }
     }
     override func removeFromSuperview() {
-        if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
+        removeMonitors()
         super.removeFromSuperview()
+    }
+    private func removeMonitors() {
+        monitors.forEach(NSEvent.removeMonitor)
+        monitors.removeAll()
     }
 }
 
@@ -737,6 +839,8 @@ private struct SuiteWires: View {
     let pending: (CGPoint, CGPoint)?
     let selected: String?
     let zoom: CGFloat
+    /// The Suite or mixing is off: wires are kept but carry nothing.
+    let paused: Bool
     @ObservedObject var meters: SuiteMeters
 
     var body: some View {
@@ -748,7 +852,7 @@ private struct SuiteWires: View {
                 let color = SuitePalette.color(for: wire.from)
                 let key = String(wire.from.drop { $0 != ":" }.dropFirst())
                 let level = meters.levels["src:" + key] ?? 0
-                if wire.implicit {
+                if wire.implicit || paused {
                     context.stroke(path, with: .color(.secondary.opacity(0.45)), style: StrokeStyle(lineWidth: width * 0.65, lineCap: .round, dash: [5 * zoom, 5 * zoom]))
                     continue
                 }
@@ -951,7 +1055,10 @@ private struct SuiteInputNode: View {
         if let failure = audio.monitorFailures[input.uid] { return failure }
         if feedbackRisk { return "May feed back on the speakers" }
         if audio.micMuted { return "Muted" }
-        let state = audio.monitorOutputs(input).isEmpty ? "Wire to an output to listen" : "Monitoring"
+        // Which apps record from this microphone; each app picks its own input in its settings.
+        let users = audio.appsUsing(input: input)
+        let state = !users.isEmpty ? "Used by " + users.joined(separator: ", ")
+            : audio.monitorOutputs(input).isEmpty ? "Wire to an output to listen" : "Monitoring"
         return input.isDefault ? "Default · " + state : state
     }
     private var statusColor: Color { audio.monitorFailures[input.uid] != nil || feedbackRisk ? .orange : .secondary }

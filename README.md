@@ -25,8 +25,8 @@ A small macOS menu bar mixer for your apps, speakers, and microphones. Adjust Sa
 - Mute sound or microphones from the top bar.
 - Choose an output or input device and adjust its volume or microphone gain.
 - Right-click a device to give it a custom name in Voidamp.
-- Save your device selections, levels, and mute states as **profiles**.
-- Open **More → Open Voidamp Suite…** for a node editor. Drag apps, microphones and outputs from the sidebar onto the board, then drag a wire from an app to any output to play it there. Wire one app to several outputs, send alerts to their own device, or wire a microphone to headphones to hear yourself. Apps without a wire play on the default output. The mouse wheel zooms from 50% to 150%; drag the empty board to move around.
+- Save your device selections, levels, mute states and Suite wiring as **profiles** from **More → Profiles**.
+- Click **Suite** in the panel (or **More → Open Voidamp Suite…**) for a node editor. Drag apps, microphones and outputs from the sidebar onto the board, then drag a wire from an app to any output to play it there. Wire one app to several outputs, send alerts to their own device, or wire a microphone to headphones to hear yourself. Apps without a wire play on the default output, and apps that pick their own output keep it. Select nodes with a click or ⌘A and remove them with Delete, which also removes their wires. The **Suite** switch in the corner pauses all wires without forgetting them; turning Mixing off in the panel pauses them too. In the panel, an app the Suite sends elsewhere shows a small icon of its output, and the Mic button gets an orange dot while you hear a microphone. Input nodes show which apps are recording from that microphone. The mouse wheel zooms from 50% to 150%; drag the empty board to move around.
 - Volume and brightness keys show Voidamp’s own overlay at the top of the screen. Hover over it to drag the level or click the speaker to mute. It needs Accessibility permission and can be turned off with **More → Volume & Brightness Overlay**.
 - Check for signed updates from **More → Check for Updates…**. Right-click the menu bar icon for the same More menu.
 - Enable **More → Start at Login** to launch Voidamp automatically. If macOS asks for approval, use **Approve Start at Login…**.
@@ -37,7 +37,7 @@ Voidamp stays in your menu bar with no Dock icon. Its icon follows the active ou
 
 ![Voidamp compact toolbar](docs/images/toolbar.png)
 
-*Development screenshots; the current release uses native checkboxes, a Mixing switch, and a combined Profiles/More island.*
+*Development screenshots; the current release uses native checkboxes, a Mixing switch, and a combined Suite/More island.*
 
 ## If macOS blocks the app
 
@@ -93,7 +93,7 @@ The top **Sound** and **Mic** buttons toggle mute across connected devices, usin
 
 ## Profiles
 
-Use **Profiles → Save current as profile…** to save output/input device selection, writable device levels, app levels/mutes, global mute states, and whether app mixing is enabled. Profiles persist locally. Device unique identifiers keep profiles usable after reconnecting hardware. Missing devices are skipped; saved app settings apply when those apps next play audio with mixing enabled. Restoring a profile with mixing enabled resumes its app routes; macOS still requires system audio permission.
+Use **More → Profiles → Save Current as Profile…** to save output/input device selection, writable device levels, app levels/mutes, the Suite’s app wiring, global mute states, and whether app mixing is enabled. Profiles persist locally. Device unique identifiers keep profiles usable after reconnecting hardware. Missing devices are skipped; saved app settings apply when those apps next play audio with mixing enabled. Restoring a profile with mixing enabled resumes its app routes; macOS still requires system audio permission.
 
 ## Validation
 
