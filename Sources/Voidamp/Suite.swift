@@ -773,6 +773,23 @@ private struct SuiteCanvas: View {
     @ViewBuilder
     private func contextMenu(_ item: SuiteItem, wires: [SuiteWire]) -> some View {
         let removable = wires.filter { !$0.implicit && ($0.from == item.id || $0.to == item.id) }
+        if item.kind == .app, item.id != "app:" + AppSource.systemSoundsID {
+            // Microphones (and other apps) to feed into this app, without dragging.
+            let fed = Set(wires.filter { $0.to == item.id && !$0.implicit }.map(\.from))
+            let mics = catalog.filter { $0.kind == .input }
+            Menu("Add Microphone") {
+                ForEach(mics) { mic in
+                    Button {
+                        if board.placed[mic.id] == nil { board.place(mic, at: spotBeside(item.id, left: true)) }
+                        connect(mic.id, item.id)
+                    } label: {
+                        if fed.contains(mic.id) { Label(mic.title, systemImage: "checkmark") } else { Text(mic.title) }
+                    }
+                    .disabled(fed.contains(mic.id))
+                }
+                if mics.isEmpty { Text("No microphones") }
+            }
+        }
         if !removable.isEmpty {
             // In Patchbay mode an app without wires is silent, so say so.
             let patchbay = item.kind == .app && audio.patchbayMode && audio.suiteEnabled
@@ -820,6 +837,7 @@ private struct SuiteCanvas: View {
             .onEnded { _ in panStart = nil; viewport.save() }
     }
 
+    /// Places dropped items where they land. Wires are only ever made by dragging them.
     private func drop(_ ids: [String], at location: CGPoint) -> Bool {
         var offset: CGFloat = 0
         var placedAny = false
@@ -833,10 +851,23 @@ private struct SuiteCanvas: View {
         return placedAny
     }
 
+    /// A free spot beside a node: to its left for things feeding it, to its right for where it plays, below any node
+    /// already there.
+    private func spotBeside(_ id: String, left: Bool) -> CGPoint {
+        guard let origin = board.placed[id] else { return board.freeSpot(near: viewport.visibleCenter) }
+        let size = SuiteMetrics.nodeSize
+        var spot = CGPoint(x: origin.x + (left ? -(size.width + 140) : size.width + 140), y: origin.y)
+        while board.placed.values.contains(where: { abs($0.x - spot.x) < size.width * 0.6 && abs($0.y - spot.y) < size.height * 0.9 }) {
+            spot.y += size.height + 18
+        }
+        return spot
+    }
+
     // MARK: Wiring
 
     private func makeWires(_ nodes: [SuiteItem]) -> [SuiteWire] {
         let onBoard = Set(nodes.map(\.id))
+        let patchbay = audio.patchbayMode && audio.suiteEnabled
         var wires: [SuiteWire] = []
         let outputs = audio.sources.filter { !$0.input }
         let defaultOutput = outputs.first(where: \.isDefault)
@@ -862,14 +893,15 @@ private struct SuiteCanvas: View {
             for uid in audio.monitorOutputs(input) where outputs.contains(where: { $0.uid == uid }) {
                 wires.append(SuiteWire(from: item.id, to: "out:" + uid, implicit: false))
             }
-            // Apps recording from this microphone, chosen in the app's own settings: shown, not wireable.
-            for id in audio.appIDsUsing(input: input) where onBoard.contains("app:" + id) {
+            // Apps recording from this microphone, chosen in the app's own settings: shown, not wireable. Patchbay
+            // shows only the wires you made.
+            for id in audio.appIDsUsing(input: input) where onBoard.contains("app:" + id) && !patchbay {
                 wires.append(SuiteWire(from: item.id, to: "app:" + id, implicit: true, label: "mic in use"))
             }
         }
         for item in nodes where item.virtual {
             guard let micSide = audio.sources.first(where: { $0.input && $0.uid == item.key }) else { continue }
-            for id in audio.appIDsUsing(input: micSide) where onBoard.contains("app:" + id) {
+            for id in audio.appIDsUsing(input: micSide) where onBoard.contains("app:" + id) && !patchbay {
                 wires.append(SuiteWire(from: item.id, to: "app:" + id, implicit: true, label: "mic in use"))
             }
         }
