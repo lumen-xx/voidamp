@@ -911,6 +911,13 @@ extension AudioController {
     private func micIsRecorded(_ uid: String) -> Bool {
         sources.contains { $0.input && $0.uid == uid && !(inputUsers[$0.device] ?? []).isEmpty }
     }
+    /// Wires a virtual mic to an app by hand: that is the mic the app records from.
+    func assignMic(_ uid: String, to appID: String) { setAppInput(appID, uid) }
+    func clearAppInput(_ appID: String) {
+        guard appInputs.removeValue(forKey: appID) != nil else { return }
+        preferences.set(appInputs, forKey: "appInputs")
+    }
+
     /// The virtual mic already feeding an app, without assigning one.
     func feedingMicUID(for appID: String) -> String? { appInputs[appID] }
     /// Whether an app records from the virtual mic that feeds it; nil while it records nothing at all.
