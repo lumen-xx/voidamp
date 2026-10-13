@@ -276,6 +276,7 @@ final class MonitorRoute {
     private let peak = OSAllocatedUnfairLock(initialState: Float(0))
     private var observedCount: UInt64 = 0
     private var lastProgress = Date()
+    private let created = Date()
 
     init(input: AudioDeviceID, output: AudioDeviceID, gain: Double) throws {
         guard let inputUID = HAL.string(input, kAudioDevicePropertyDeviceUID),
@@ -335,6 +336,10 @@ final class MonitorRoute {
         let count = callbacks.withLock { $0 }
         if count != observedCount { observedCount = count; lastProgress = now; return false }
         return now.timeIntervalSince(lastProgress) > 2
+    }
+    /// Whether audio has been flowing for at least this long, so earlier stalls no longer count against it.
+    func hasRun(for seconds: TimeInterval, now: Date = Date()) -> Bool {
+        callbacks.withLock { $0 } > 0 && now.timeIntervalSince(created) >= seconds
     }
     func setGain(_ value: Double) { gain.withLock { $0 = Float(value) } }
     func takePeak() -> Float { peak.withLock { let value = $0; $0 = 0; return value } }

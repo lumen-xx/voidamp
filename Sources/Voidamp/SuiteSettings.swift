@@ -102,7 +102,19 @@ struct SuiteSettings: View {
                 }
             }
             Section {
-                Button("Quit Voidamp") { audio.shutDown(); NSApplication.shared.terminate(nil) }
+                Button("Quit Voidamp") { NSApplication.shared.terminate(nil) }
+                // As in opyuii's other apps; stacked, because the sidebar is narrow. A sidebar list draws no
+                // section footers, so this is a row.
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 10) {
+                        Link("GitHub", destination: URL(string: "https://github.com/lumen-xx/voidamp-releases")!)
+                        Link("opyuii.com", destination: URL(string: "https://opyuii.com")!)
+                    }
+                    Text("© \(String(Calendar.current.component(.year, from: Date()))) opyuii. All rights reserved.")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.system(size: 11))
+                .padding(.top, 6)
             }
         }
         .listStyle(.sidebar)

@@ -101,8 +101,15 @@ final class AudioController: ObservableObject {
     private var watcher: ProcessWatcher?
     private let preferences: UserDefaults
     private var terminationObserver: NSObjectProtocol?
+    private var wakeObserver: NSObjectProtocol?
     private var timer: Timer?
-    private var savedVolumes: [String: Double] = [:]
+    /// Levels of outputs muted in the Suite by setting their volume to 0, to return to when they're unmuted. Saved,
+    /// so unmuting after Voidamp restarts doesn't fall back to 50%.
+    private var savedVolumes: [String: Double] = [:] { didSet { preferences.set(savedVolumes, forKey: "savedVolumes") } }
+    #if DEBUG
+    /// Meter readings for the sample data of `--demo`, which has no routes to measure.
+    var demoLevels: (sources: [String: Float], outputs: [String: Float])?
+    #endif
 
     init(preferences: UserDefaults = .standard, autoStartMixing: Bool = true) {
         self.preferences = preferences
@@ -122,11 +129,19 @@ final class AudioController: ObservableObject {
         soundMuted = preferences.bool(forKey: "soundMuted")
         micMuted = preferences.bool(forKey: "micMuted")
         mutedDevices = preferences.dictionary(forKey: "mutedDevices") as? [String: Double] ?? [:]
+        savedVolumes = preferences.dictionary(forKey: "savedVolumes") as? [String: Double] ?? [:]
         refresh()
         listenForDeviceChanges()
         if autoStartMixing { watcher = ProcessWatcher { [weak self] in self?.refreshApps() } }
         terminationObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.shutDown() }
+        }
+        // Sleep stops every monitor; that isn't a device failing, so microphone wires start counting stalls afresh.
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.monitorStalls.removeAll()
+                self?.updateMonitors()
+            }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
@@ -300,8 +315,10 @@ final class AudioController: ObservableObject {
     }
 
     func toggleMute(_ source: AudioSource) {
-        if source.volume > 0 {
-            savedVolumes[source.id] = source.volume
+        // While the Sound button holds the device at 0, this mutes or unmutes the level it returns to.
+        let level = displayVolume(source)
+        if level > 0 {
+            savedVolumes[source.id] = level
             setVolume(source, 0)
         } else {
             setVolume(source, savedVolumes[source.id] ?? 0.5)
@@ -402,6 +419,10 @@ extension AudioController {
 
     /// Devices unplugged while muted keep their level to return to; restore it when they come back unmuted.
     private func restorePendingVolumes() {
+        // Muted with their own mute switch, then unplugged before Sound or Mic was unmuted: unmute them on return.
+        for source in sources where !(source.input ? micMuted : soundMuted) && nativeMuteStates[source.id] != nil {
+            _ = useHardwareMute(source, muted: false)
+        }
         for source in sources where !(source.input ? micMuted : soundMuted) && !source.channels.isEmpty {
             guard let held = mutedDevices[source.id], nativeMuteStates[source.id] == nil else { continue }
             if writeVolume(source, held) { mutedDevices.removeValue(forKey: source.id) }
@@ -1120,8 +1141,9 @@ extension AudioController {
             if wanted[key] != nil { monitorStalls[key, default: 0] += 1 }
             monitors.removeValue(forKey: key)
         }
-        // Forget stalls of wires that are gone, so wiring again starts fresh.
-        monitorStalls = monitorStalls.filter { wanted[$0.key] != nil }
+        // Forget stalls of wires that are gone, so wiring again starts fresh, and of monitors that have run well for
+        // a while since: only stalls close together mean a device that never runs.
+        monitorStalls = monitorStalls.filter { wanted[$0.key] != nil && !(monitors[$0.key]?.hasRun(for: 30) ?? false) }
         guard !wanted.isEmpty else {
             if !monitorFailures.isEmpty { monitorFailures.removeAll() }
             return
@@ -1153,6 +1175,9 @@ extension AudioController {
     /// The loudest level since the last call for each source and output that Voidamp plays. Apps playing
     /// directly, without a route, have no reading.
     func takePeaks() -> (sources: [String: Float], outputs: [String: Float]) {
+        #if DEBUG
+        if let demoLevels { return (demoLevels.sources.mapValues { $0 * .random(in: 0.8...1) }, demoLevels.outputs.mapValues { $0 * .random(in: 0.8...1) }) }
+        #endif
         var bySource: [String: Float] = [:]
         var byOutput: [String: Float] = [:]
         for (key, route) in routes {
@@ -1169,7 +1194,10 @@ extension AudioController {
     }
     /// Whether a source currently plays through Voidamp, so its meter means something.
     func isRouted(_ sourceID: String) -> Bool {
-        routes.keys.contains { $0.source == sourceID } || monitors.keys.contains { $0.source == sourceID }
+        #if DEBUG
+        if demoLevels?.sources[sourceID] != nil { return true }
+        #endif
+        return routes.keys.contains { $0.source == sourceID } || monitors.keys.contains { $0.source == sourceID }
     }
 }
 
@@ -1242,3 +1270,127 @@ extension AudioController {
         else if !live.channels.isEmpty { toggleMute(live) }
     }
 }
+
+// MARK: Undo and quitting
+
+/// The Suite's wiring for some apps and microphones, so a change to it can be undone exactly.
+struct WiringSnapshot {
+    /// App id → the outputs it is wired to, in order.
+    var apps: [String: [String]] = [:]
+    /// Input UID → the outputs it is played on.
+    var monitors: [String: [String]] = [:]
+    /// Whether System Sounds' wire is part of it, and where the Suite had moved them (with the device before).
+    var coversAlerts = false
+    var alerts: (output: String, before: String)?
+}
+
+extension AudioController {
+    /// The wiring of these apps and inputs, and of everything wired into these outputs.
+    func wiringSnapshot(apps: [String] = [], inputs: [String] = [], outputs: [String] = []) -> WiringSnapshot {
+        var snapshot = WiringSnapshot()
+        let outputs = Set(outputs)
+        let appIDs = Set(apps).union(appSettings.filter { !outputs.isDisjoint(with: $0.value.outputs) }.keys)
+        for id in appIDs where id != AppSource.systemSoundsID { snapshot.apps[id] = appSettings[id]?.outputs ?? [] }
+        for id in Set(inputs).union(monitorWiring.filter { !outputs.isDisjoint(with: $0.value) }.keys) { snapshot.monitors[id] = monitorWiring[id] ?? [] }
+        if apps.contains(AppSource.systemSoundsID) {
+            snapshot.coversAlerts = true
+            if let before = alertBeforeSuite, let output = alertOutput { snapshot.alerts = (output.uid, before) }
+        }
+        return snapshot
+    }
+
+    /// The same apps and inputs as `snapshot`, as they are wired now.
+    func wiringSnapshot(like snapshot: WiringSnapshot) -> WiringSnapshot {
+        wiringSnapshot(apps: Array(snapshot.apps.keys) + (snapshot.coversAlerts ? [AppSource.systemSoundsID] : []), inputs: Array(snapshot.monitors.keys))
+    }
+
+    /// Puts the wiring in a snapshot back, and leaves everything else alone.
+    func restore(_ snapshot: WiringSnapshot) {
+        for (id, outputs) in snapshot.apps {
+            var setting = appSettings[id] ?? .unchanged
+            setting.outputs = outputs
+            appSettings[id] = setting
+            if !outputs.isEmpty, routeFailures[id] != nil { forgetFailure(id) }
+        }
+        if !snapshot.apps.isEmpty {
+            persistAppSettings()
+            objectWillChange.send()
+            updateRoutes(live: Set(HAL.ids(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList)), now: Date())
+        }
+        for (input, outputs) in snapshot.monitors { monitorWiring[input] = outputs.isEmpty ? nil : outputs }
+        if !snapshot.monitors.isEmpty {
+            persistMonitors()
+            updateMonitors()
+        }
+        if snapshot.coversAlerts {
+            if let alerts = snapshot.alerts {
+                guard let output = sources.first(where: { !$0.input && $0.uid == alerts.output }) else { return }
+                if alertBeforeSuite == nil { alertBeforeSuite = alerts.before }
+                setAlertOutput(output)
+            } else {
+                restoreAlertOutput()
+            }
+        }
+    }
+
+    /// Virtual mics that apps are recording from while Voidamp feeds them, with those apps' names. Quitting
+    /// Voidamp leaves them hearing silence.
+    var virtualMicListeners: [(mic: String, apps: [String])] {
+        guard suiteEnabled, mixingEnabled else { return [] }
+        return sources.filter { $0.input && $0.isVirtualMic && feedCount(intoMic: $0.uid) > 0 }.compactMap { mic in
+            let apps = (inputUsers[mic.device] ?? []).map(\.name)
+            return apps.isEmpty ? nil : (displayName(mic), apps)
+        }
+    }
+}
+
+#if DEBUG
+// MARK: Sample data for screenshots
+
+extension AudioController {
+    /// Sample apps, devices and wiring for screenshots (`--demo`). The controller stops reading devices before the
+    /// samples go in, and with no routes or monitors nothing reaches a real device.
+    static func demo() -> AudioController {
+        let suite = "app.voidamp.demo"
+        let audio = AudioController(preferences: UserDefaults(suiteName: suite)!, autoStartMixing: false)
+        audio.shutDown()
+        UserDefaults.standard.removePersistentDomain(forName: suite)
+        let mic1 = VirtualMics.uidPrefix + "1", mic2 = VirtualMics.uidPrefix + "2"
+        func device(_ id: AudioDeviceID, _ uid: String, _ name: String, input: Bool, volume: Double, isDefault: Bool = false, builtIn: Bool = false) -> AudioSource {
+            AudioSource(device: id, uid: uid, name: name, input: input, channels: [0], volume: volume, isDefault: isDefault, isBuiltIn: builtIn, hasMuteSwitch: true)
+        }
+        audio.sources = [
+            device(9001, "demo.speakers", "MacBook Pro Speakers", input: false, volume: 0.5, builtIn: true),
+            device(9002, "demo.airpods", "AirPods Pro", input: false, volume: 0.62, isDefault: true),
+            device(9003, "demo.display", "Studio Display Speakers", input: false, volume: 0.75),
+            device(9004, mic1, "Voidamp Mic 1", input: false, volume: 1),
+            device(9005, mic2, "Voidamp Mic 2", input: false, volume: 1),
+            device(9011, "demo.mic", "MacBook Pro Microphone", input: true, volume: 0.7, builtIn: true),
+            device(9012, "demo.shure", "Shure MV7", input: true, volume: 0.8, isDefault: true),
+            device(9004, mic1, "Voidamp Mic 1", input: true, volume: 1),
+            device(9005, mic2, "Voidamp Mic 2", input: true, volume: 1)
+        ]
+        func icon(_ id: String) -> NSImage? { NSWorkspace.shared.urlForApplication(withBundleIdentifier: id).map { NSWorkspace.shared.icon(forFile: $0.path) } }
+        func app(_ id: String, _ name: String, gain: Double, playing: Bool = true, outputs: [String] = []) -> AppSource {
+            audio.appSettings[id] = AppSetting(gain: gain, muted: false, outputs: outputs)
+            return AppSource(id: id, name: name, icon: icon(id), processes: playing ? [0x7FFF_0000 + AudioObjectID(name.count)] : [], gain: gain, muted: false)
+        }
+        audio.apps = [
+            app("com.brave.Browser", "Brave Browser", gain: 0.6),
+            app("com.hnc.Discord", "Discord", gain: 1.35, playing: false),
+            app("com.apple.Safari", "Safari", gain: 1, outputs: ["demo.display"]),
+            app("com.spotify.client", "Spotify", gain: 0.8, outputs: ["demo.airpods", mic1]),
+            AppSource(id: AppSource.systemSoundsID, name: "System Sounds", icon: nil, processes: [], gain: 1, muted: false)
+        ]
+        // Discord plays on the Mac's speakers by its own choice and records from Voidamp Mic 1.
+        audio.lastOwnOutputs["com.hnc.Discord"] = "demo.speakers"
+        audio.monitorWiring = ["demo.shure": [mic1]]
+        audio.inputUsers = [9004: [InputUser(id: "com.hnc.Discord", name: "Discord")]]
+        audio.alertDevice = 9002
+        audio.mixingEnabled = true
+        audio.demoLevels = (["com.spotify.client": 0.5, "com.apple.Safari": 0.22, "com.brave.Browser": 0.12, "demo.shure": 0.35],
+                            ["demo.airpods": 0.5, "demo.display": 0.22, mic1: 0.55])
+        return audio
+    }
+}
+#endif

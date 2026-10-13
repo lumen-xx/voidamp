@@ -7,6 +7,7 @@ import ApplicationServices
 /// (Accessibility permission), applied by Voidamp, and shown in a glass pill centred on the display with the mouse. When Voidamp
 /// quits the tap goes away and macOS shows its own overlay again. Keys Voidamp cannot apply, such as volume on a
 /// device that controls its own level or brightness without a built-in display, are passed to macOS unchanged.
+/// The tap runs on its own thread (see MediaKeyTap), so a busy main thread never holds up the keyboard.
 @MainActor
 final class ControlOverlay {
     static let enabledKey = "controlOverlayEnabled"
@@ -14,8 +15,8 @@ final class ControlOverlay {
 
     private let audio: AudioController
     private let panelShown: () -> Bool
-    private var tap: CFMachPort?
-    private var source: CFRunLoopSource?
+    private var keys: MediaKeyTap?
+    private var outputWatch: AnyCancellable?
     private var trustTimer: Timer?
     private let model = OverlayModel()
     private lazy var window = OverlayWindow(model: model)
@@ -25,8 +26,6 @@ final class ControlOverlay {
     private var hoverTimer: Timer?
     private var restingSince: Date?
     private var pointerAtShow = NSPoint.zero
-    /// Keys whose press was handled, so their release is swallowed too and the two always agree.
-    fileprivate var swallowedKeys: Set<Int32> = []
 
     var enabled: Bool {
         get { UserDefaults.standard.object(forKey: Self.enabledKey) as? Bool ?? true }
@@ -53,7 +52,7 @@ final class ControlOverlay {
 
     /// Installs the tap, asking for Accessibility once; afterwards it waits quietly until permission is granted.
     func start(prompt: Bool = false) {
-        guard enabled, tap == nil else { return }
+        guard enabled, keys == nil else { return }
         if !trusted {
             let firstTime = !UserDefaults.standard.bool(forKey: Self.promptedKey)
             if prompt || firstTime {
@@ -75,13 +74,20 @@ final class ControlOverlay {
             }
             return
         }
-        let mask = CGEventMask(1) << 14 // NX_SYSDEFINED: media and brightness keys
-        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: mask,
-                                          callback: overlayTapCallback, userInfo: Unmanaged.passUnretained(self).toOpaque()) else { return }
-        self.tap = tap
-        source = CFMachPortCreateRunLoopSource(nil, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
+        let keys = MediaKeyTap { [weak self] key, flags in
+            // The tap already took the key; if it can't be applied after all (the output just went away), it's dropped.
+            _ = self?.handle(key: key, flags: flags)
+        }
+        keys.volumeAdjustable = Self.volumeAdjustable(audio.sources)
+        guard keys.start() else { return }
+        self.keys = keys
+        // The tap decides from this alone whether to take a volume key, without waiting for the main thread.
+        outputWatch = audio.$sources.sink { [weak keys] sources in keys?.volumeAdjustable = Self.volumeAdjustable(sources) }
+    }
+
+    /// Whether the default output has a volume Voidamp can set.
+    nonisolated static func volumeAdjustable(_ sources: [AudioSource]) -> Bool {
+        sources.first(where: { !$0.input && $0.isDefault }).map { !$0.channels.isEmpty } ?? false
     }
 
     private func explainAccessibility() -> Bool {
@@ -96,17 +102,14 @@ final class ControlOverlay {
 
     func stop() {
         trustTimer?.invalidate(); trustTimer = nil
-        if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
-        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
-        tap = nil; source = nil
+        keys?.stop(); keys = nil
+        outputWatch = nil
         model.dragging = false
         window.orderOut(nil)
     }
 
-    fileprivate func reenable() { if let tap { CGEvent.tapEnable(tap: tap, enable: true) } }
-
-    /// Applies a key press and returns whether it was handled. Unhandled keys reach macOS unchanged.
-    fileprivate func handle(key: Int32, flags: NSEvent.ModifierFlags) -> Bool {
+    /// Applies a key press the tap took, and returns whether it could be applied.
+    private func handle(key: Int32, flags: NSEvent.ModifierFlags) -> Bool {
         // Option alone opens Sound or Displays settings in macOS; leave that to the system.
         if flags.contains(.option) && !flags.contains(.shift) { return false }
         let steps: Double = flags.contains(.option) && flags.contains(.shift) ? 64 : 16
@@ -237,47 +240,101 @@ final class ControlOverlay {
     }
 }
 
-/// System-defined events carry media keys as subtype 8: the key code in the upper 16 bits of data1 and the
-/// key state (0xA down, 0xB up) in bits 8–15.
-private func overlayTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
-    guard let refcon else { return Unmanaged.passUnretained(event) }
-    let overlay = Unmanaged<ControlOverlay>.fromOpaque(refcon).takeUnretainedValue()
-    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-        MainActor.assumeIsolated { overlay.reenable() }
-        return Unmanaged.passUnretained(event)
-    }
-    guard type.rawValue == 14, let system = NSEvent(cgEvent: event), system.subtype.rawValue == 8 else { return Unmanaged.passUnretained(event) }
-    let key = Int32((system.data1 & 0xFFFF0000) >> 16)
-    let down = ((system.data1 & 0x0000FF00) >> 8) == 0xA
-    guard [NX_KEYTYPE_SOUND_UP, NX_KEYTYPE_SOUND_DOWN, NX_KEYTYPE_MUTE, NX_KEYTYPE_BRIGHTNESS_UP, NX_KEYTYPE_BRIGHTNESS_DOWN].contains(key) else { return Unmanaged.passUnretained(event) }
-    let flags = system.modifierFlags.intersection(.deviceIndependentFlagsMask)
-    // The event tap runs on the main run loop, so the overlay can be used directly. A press is swallowed only when
-    // Voidamp applied it; its release follows the press, so macOS never sees half a key.
-    let swallow = MainActor.assumeIsolated { () -> Bool in
-        if down {
-            let handled = overlay.wouldHandle(key: key, flags: flags) && overlay.handle(key: key, flags: flags)
-            if handled { overlay.swallowedKeys.insert(key) } else { overlay.swallowedKeys.remove(key) }
-            return handled
-        }
-        return overlay.swallowedKeys.remove(key) != nil
-    }
-    return swallow ? nil : Unmanaged.passUnretained(event)
-}
+/// The event tap for the volume and brightness keys, on a thread of its own. macOS holds every key event until a
+/// tap answers, and switches off a tap that answers too slowly, so the answer must not wait for the main thread,
+/// which may be busy redrawing the Suite or talking to an audio device. The tap decides from `volumeAdjustable`,
+/// which the main thread keeps current, and from the displays; it then hands the key to the main thread to apply.
+final class MediaKeyTap: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _volumeAdjustable = false
+    /// Keys whose press was taken, so their release is taken too and macOS never sees half a key.
+    private var swallowed: Set<Int32> = []
+    private var port: CFMachPort?
+    private var loop: CFRunLoop?
+    private let apply: @MainActor (Int32, NSEvent.ModifierFlags) -> Void
 
-extension ControlOverlay {
-    /// Whether a key would be handled, decided before acting so presses and releases are treated alike.
-    fileprivate func wouldHandle(key: Int32, flags: NSEvent.ModifierFlags) -> Bool {
-        if flags.contains(.option) && !flags.contains(.shift) { return false }
+    /// Whether the default output's volume can be set; volume keys pass to macOS when it can't.
+    var volumeAdjustable: Bool {
+        get { lock.withLock { _volumeAdjustable } }
+        set { lock.withLock { _volumeAdjustable = newValue } }
+    }
+
+    init(apply: @escaping @MainActor (Int32, NSEvent.ModifierFlags) -> Void) { self.apply = apply }
+
+    /// Creates the tap and starts its thread; false when macOS refuses the tap.
+    func start() -> Bool {
+        let mask = CGEventMask(1) << 14 // NX_SYSDEFINED: media and brightness keys
+        guard let port = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: mask,
+                                           callback: mediaKeyCallback, userInfo: Unmanaged.passUnretained(self).toOpaque()),
+              let source = CFMachPortCreateRunLoopSource(nil, port, 0) else { return false }
+        lock.withLock { self.port = port }
+        // The thread keeps this object alive for as long as its run loop can call back.
+        let thread = Thread { [self] in
+            let loop = CFRunLoopGetCurrent()
+            lock.withLock { self.loop = loop }
+            CFRunLoopAddSource(loop, source, .commonModes)
+            CGEvent.tapEnable(tap: port, enable: true)
+            // Returns once the port is invalidated, which removes its source, or when stopped.
+            CFRunLoopRun()
+        }
+        thread.name = "Voidamp media keys"
+        thread.qualityOfService = .userInteractive
+        thread.start()
+        return true
+    }
+
+    func stop() {
+        let (port, loop) = lock.withLock { () -> (CFMachPort?, CFRunLoop?) in
+            defer { self.port = nil }
+            return (self.port, self.loop)
+        }
+        guard let port else { return }
+        CGEvent.tapEnable(tap: port, enable: false)
+        CFMachPortInvalidate(port)
+        loop.map(CFRunLoopStop)
+    }
+
+    /// Whether Voidamp takes this key: volume keys while the default output's volume can be set, brightness keys
+    /// for the built-in display while the pointer is on it. Option alone opens Sound or Displays settings in macOS.
+    static func takes(_ key: Int32, option: Bool, shift: Bool, volumeAdjustable: Bool, brightnessHere: () -> Bool) -> Bool {
+        if option && !shift { return false }
         switch key {
-        case NX_KEYTYPE_SOUND_UP, NX_KEYTYPE_SOUND_DOWN, NX_KEYTYPE_MUTE:
-            return audio.sources.first(where: { !$0.input && $0.isDefault }).map { !$0.channels.isEmpty } ?? false
-        case NX_KEYTYPE_BRIGHTNESS_UP, NX_KEYTYPE_BRIGHTNESS_DOWN:
-            // Only the built-in display, and only with the pointer on it; other displays are macOS's to handle.
-            return DisplayBrightness.level() != nil && DisplayBrightness.pointerOnBuiltIn
-        default:
+        case NX_KEYTYPE_SOUND_UP, NX_KEYTYPE_SOUND_DOWN, NX_KEYTYPE_MUTE: return volumeAdjustable
+        case NX_KEYTYPE_BRIGHTNESS_UP, NX_KEYTYPE_BRIGHTNESS_DOWN: return brightnessHere()
+        default: return false
+        }
+    }
+
+    /// Runs on the tap's thread. System-defined events carry media keys as subtype 8: the key code in the upper
+    /// 16 bits of data1 and the key state (0xA down, 0xB up) in bits 8–15.
+    fileprivate func receive(_ type: CGEventType, _ event: CGEvent) -> Bool {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let port = lock.withLock({ port }) { CGEvent.tapEnable(tap: port, enable: true) }
             return false
         }
+        guard type.rawValue == 14, let system = NSEvent(cgEvent: event), system.subtype.rawValue == 8 else { return false }
+        let key = Int32((system.data1 & 0xFFFF0000) >> 16)
+        let down = ((system.data1 & 0x0000FF00) >> 8) == 0xA
+        guard [NX_KEYTYPE_SOUND_UP, NX_KEYTYPE_SOUND_DOWN, NX_KEYTYPE_MUTE, NX_KEYTYPE_BRIGHTNESS_UP, NX_KEYTYPE_BRIGHTNESS_DOWN].contains(key) else { return false }
+        guard down else { return lock.withLock { swallowed.remove(key) != nil } }
+        let flags = event.flags
+        let take = Self.takes(key, option: flags.contains(.maskAlternate), shift: flags.contains(.maskShift),
+                              volumeAdjustable: volumeAdjustable) { DisplayBrightness.isBuiltIn(at: event.location) }
+        lock.withLock {
+            if take { swallowed.insert(key) } else { swallowed.remove(key) }
+        }
+        guard take else { return false }
+        let modifiers = NSEvent.ModifierFlags(rawValue: UInt(flags.rawValue)).intersection(.deviceIndependentFlagsMask)
+        let apply = self.apply
+        DispatchQueue.main.async { MainActor.assumeIsolated { apply(key, modifiers) } }
+        return true
     }
+}
+
+private func mediaKeyCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
+    guard let refcon else { return Unmanaged.passUnretained(event) }
+    let tap = Unmanaged<MediaKeyTap>.fromOpaque(refcon).takeUnretainedValue()
+    return tap.receive(type, event) ? nil : Unmanaged.passUnretained(event)
 }
 
 /// Hides the pointer while Voidamp is in the background. NSCursor.hide only works for the active app, so this asks
@@ -321,11 +378,14 @@ enum DisplayBrightness {
         guard CGGetOnlineDisplayList(count, &displays, &count) == .success else { return nil }
         return displays.first { CGDisplayIsBuiltin($0) != 0 && CGDisplayIsActive($0) != 0 }
     }
-    /// Whether the pointer is on the built-in display, which the brightness keys then belong to.
-    static var pointerOnBuiltIn: Bool {
-        let mouse = NSEvent.mouseLocation
-        guard let builtIn, let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) else { return false }
-        return (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == builtIn
+    /// Whether a point in global display coordinates (an event's location) is on the built-in display, whose
+    /// brightness Voidamp can set. Core Graphics only, so it can be asked from the key tap's thread.
+    static func isBuiltIn(at point: CGPoint) -> Bool {
+        guard getter != nil, setter != nil else { return false }
+        var display: CGDirectDisplayID = 0
+        var count: UInt32 = 0
+        guard CGGetDisplaysWithPoint(point, 1, &display, &count) == .success, count == 1 else { return false }
+        return CGDisplayIsBuiltin(display) != 0 && CGDisplayIsActive(display) != 0
     }
     static var name: String {
         NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == builtIn }?.localizedName ?? "Built-in Display"
@@ -568,7 +628,8 @@ enum OverlaySnapshot {
         let brightness = OverlayModel(); brightness.kind = .brightness; brightness.title = "Built-in Retina Display"; brightness.level = 0.8
         let view = VStack(spacing: 4) { ForEach(Array([volume, muted, brightness].enumerated()), id: \.offset) { OverlayCard(model: $0.element).padding(14) } }
             .padding(10)
-            .background(LinearGradient(colors: dark ? [Color(white: 0.18), Color(red: 0.12, green: 0.16, blue: 0.24)] : [Color(white: 0.93), Color(red: 0.82, green: 0.86, blue: 0.93)], startPoint: .topLeading, endPoint: .bottomTrailing))
+            // `--clear` leaves the backdrop out, for putting the cards on another background.
+            .background(CommandLine.arguments.contains("--clear") ? AnyShapeStyle(Color.clear) : AnyShapeStyle(LinearGradient(colors: dark ? [Color(white: 0.18), Color(red: 0.12, green: 0.16, blue: 0.24)] : [Color(white: 0.93), Color(red: 0.82, green: 0.86, blue: 0.93)], startPoint: .topLeading, endPoint: .bottomTrailing)))
             .environment(\.colorScheme, dark ? .dark : .light)
         if CommandLine.arguments.contains("--live-window") {
             // Captures the real overlay panel, shown on screen, instead of an off-screen copy.
@@ -603,6 +664,8 @@ enum OverlaySnapshot {
         let host = NSHostingView(rootView: view)
         host.frame = CGRect(origin: .zero, size: host.fittingSize)
         let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
         window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         host.appearance = window.appearance
         window.contentView = host

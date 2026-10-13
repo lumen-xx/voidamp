@@ -5,7 +5,7 @@ VERSION="${1:?Usage: bash scripts/publish-release.sh VERSION}"
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then exit 1; fi
 REPOSITORY="$(cat updates/repository.txt)"
 RELEASE_DIR="dist/releases/$VERSION"
-if [ ! -f "$RELEASE_DIR/appcast.xml" ] || [ ! -f "$RELEASE_DIR/Voidamp-$VERSION.zip" ]; then
+if [ ! -f "$RELEASE_DIR/appcast.xml" ] || [ ! -f "$RELEASE_DIR/Voidamp-$VERSION.zip" ] || [ ! -f docs/RELEASE_NOTES.md ]; then
     echo "Prepare and verify this release first." >&2
     exit 1
 fi
@@ -20,5 +20,17 @@ python3 scripts/verify-release.py "$RELEASE_DIR/appcast.xml" "$RELEASE_DIR/Voida
 gh release create "v$VERSION" \
     "$RELEASE_DIR/Voidamp-$VERSION.zip" "$RELEASE_DIR/appcast.xml" \
     --repo "$REPOSITORY" --title "Voidamp $VERSION" \
-    --notes "Native macOS menu bar audio mixer. Includes signed Sparkle updates. Requires macOS 14.2 or newer and an Apple silicon Mac." \
+    --notes-file docs/RELEASE_NOTES.md \
     --latest
+# The release page describes the current version, with its screenshots. The feed itself is a release asset.
+PAGE="$(pwd)/work/releases-repository"
+[ -d "$PAGE/.git" ] || gh repo clone "$REPOSITORY" "$PAGE"
+git -C "$PAGE" pull --ff-only origin main
+cp docs/RELEASE_README.md "$PAGE/README.md"
+mkdir -p "$PAGE/images"
+cp docs/images/*.png "$PAGE/images/"
+git -C "$PAGE" add README.md images
+if ! git -C "$PAGE" diff --cached --quiet; then
+    git -C "$PAGE" commit -m "Describe Voidamp $VERSION"
+    git -C "$PAGE" push origin HEAD:main
+fi

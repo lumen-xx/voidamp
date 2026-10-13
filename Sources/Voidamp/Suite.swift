@@ -11,6 +11,8 @@ import UniformTypeIdentifiers
 final class SuiteWindowController: NSObject, NSWindowDelegate {
     static let shared = SuiteWindowController()
     private var window: NSWindow?
+    /// Undo for the board and its wiring, also behind Edit → Undo.
+    let undoManager = UndoManager()
 
     var isOpen: Bool { window?.isVisible ?? false }
 
@@ -45,7 +47,11 @@ final class SuiteWindowController: NSObject, NSWindowDelegate {
     var windowNumber: Int? { window?.windowNumber }
     var isOnScreen: Bool { window?.occlusionState.contains(.visible) ?? false }
 
+    func windowWillReturnUndoManager(_ window: NSWindow) -> UndoManager? { undoManager }
+
     func windowWillClose(_ notification: Notification) {
+        // The board is built afresh next time, so its undo steps go with the window.
+        undoManager.removeAllActions()
         // Dropping the window stops its meters and animation.
         window?.contentView = nil
         window = nil
@@ -98,9 +104,13 @@ final class SuiteBoard: ObservableObject {
     @Published private(set) var placed: [String: CGPoint]
     /// Names of placed apps, so an app that isn't running keeps its node.
     @Published private(set) var names: [String: String]
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
+    /// Tells the audio side that apps came onto or left the board, which matters in Patchbay mode.
+    private let routingChanged: () -> Void
 
-    init() {
+    init(defaults: UserDefaults = .standard, routingChanged: (() -> Void)? = nil) {
+        self.defaults = defaults
+        self.routingChanged = routingChanged ?? { VoidampRuntime.shared.audio.boardChanged() }
         let stored = defaults.dictionary(forKey: "suiteBoard") as? [String: [Double]] ?? [:]
         placed = stored.compactMapValues { $0.count == 2 ? CGPoint(x: $0[0], y: $0[1]) : nil }
         names = defaults.dictionary(forKey: "suiteBoardNames") as? [String: String] ?? [:]
@@ -142,7 +152,7 @@ final class SuiteBoard: ObservableObject {
         defaults.set(placed.mapValues { [Double($0.x), Double($0.y)] }, forKey: "suiteBoard")
         defaults.set(names, forKey: "suiteBoardNames")
         // In patchbay mode, placing or removing an app changes whether it plays.
-        if routingChanged { VoidampRuntime.shared.audio.boardChanged() }
+        if routingChanged { self.routingChanged() }
     }
 }
 
@@ -154,9 +164,10 @@ final class SuiteViewport: ObservableObject {
     @Published var pan: CGSize
     /// The canvas size, kept by the canvas, for placing new nodes in view and fitting.
     var size = CGSize(width: 800, height: 600)
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         let view = defaults.array(forKey: "suiteBoardView") as? [Double] ?? []
         zoom = view.count == 3 ? min(SuiteMetrics.zoomRange.upperBound, max(SuiteMetrics.zoomRange.lowerBound, view[0])) : 1
         pan = view.count == 3 ? CGSize(width: view[1], height: view[2]) : .zero
@@ -200,18 +211,114 @@ final class SuiteViewport: ObservableObject {
 }
 
 extension SuiteBoard {
-    /// Takes items off the board and removes their wires: a node you can't see never routes audio.
+    /// Takes items off the board and removes their wires: a node you can't see never routes audio. Undo puts them
+    /// back where they were, wires included.
     func remove(_ ids: [String], audio: AudioController, catalog: [SuiteItem]) {
-        for id in ids {
-            if let item = catalog.first(where: { $0.id == id }) {
+        let ids = ids.filter { placed[$0] != nil }
+        guard !ids.isEmpty else { return }
+        let items = ids.compactMap { id in catalog.first { $0.id == id } }
+        SuiteUndo.record(ids.count == 1 ? "Remove from Board" : "Remove \(ids.count) Items from Board", board: self, audio: audio, nodes: ids,
+                         apps: items.filter { $0.kind == .app }.map(\.key), inputs: items.filter { $0.kind == .input }.map(\.key),
+                         outputs: items.filter { $0.kind == .output }.map(\.key)) {
+            for item in items {
                 switch item.kind {
                 case .app: audio.clearWiring(audio.appSource(id: item.key, name: item.title, icon: item.icon))
                 case .input: audio.clearWiring(input: item.key)
                 case .output: audio.clearWiring(output: item.key)
                 }
             }
-            remove(id)
+            for id in ids { remove(id) }
         }
+    }
+
+    /// Where these nodes are, and the names of placed apps; nil for a node that isn't on the board.
+    func layout(_ ids: [String]) -> [String: Placement?] {
+        Dictionary(uniqueKeysWithValues: ids.map { id in (id, placed[id].map { Placement(origin: $0, name: names[id]) }) })
+    }
+
+    /// Puts nodes back as `layout` had them.
+    func apply(_ layout: [String: Placement?]) {
+        guard !layout.isEmpty else { return }
+        // Only nodes coming onto or leaving the board change routing (in Patchbay mode); moves are just the picture.
+        let routingChanged = layout.contains { (placed[$0.key] == nil) != ($0.value == nil) }
+        for (id, placement) in layout {
+            placed[id] = placement?.origin
+            names[id] = placement?.name
+        }
+        save(routingChanged: routingChanged)
+    }
+
+    /// Places an item, so that Undo takes it off again.
+    func add(_ item: SuiteItem, at origin: CGPoint, audio: AudioController) {
+        SuiteUndo.record("Add to Board", board: self, audio: audio, nodes: [item.id]) { place(item, at: origin) }
+    }
+
+    struct Placement {
+        let origin: CGPoint
+        let name: String?
+    }
+}
+
+/// Undo and Redo for the Suite: each change records the nodes and wiring it touches before and after, and Undo
+/// puts back the earlier state of just those.
+@MainActor
+enum SuiteUndo {
+    private struct State {
+        let layout: [String: SuiteBoard.Placement?]
+        let wiring: WiringSnapshot
+    }
+
+    static func record(_ name: String, board: SuiteBoard, audio: AudioController, nodes: [String] = [], apps: [String] = [],
+                       inputs: [String] = [], outputs: [String] = [], change: () -> Void) {
+        let before = State(layout: board.layout(nodes), wiring: audio.wiringSnapshot(apps: apps, inputs: inputs, outputs: outputs))
+        change()
+        let after = State(layout: board.layout(nodes), wiring: audio.wiringSnapshot(like: before.wiring))
+        register(name, board: board, audio: audio, back: before, forward: after)
+    }
+
+    /// Undoing goes back to `back`; that registers the way forward again, which is Redo.
+    private static func register(_ name: String, board: SuiteBoard, audio: AudioController, back: State, forward: State) {
+        let manager = SuiteWindowController.shared.undoManager
+        manager.registerUndo(withTarget: board) { board in
+            MainActor.assumeIsolated {
+                board.apply(back.layout)
+                audio.restore(back.wiring)
+                register(name, board: board, audio: audio, back: forward, forward: back)
+            }
+        }
+        manager.setActionName(name)
+    }
+}
+
+extension SuiteBoard {
+    /// The board the Suite opens with: the saved one, or sample nodes with `--demo`.
+    static func forSuite() -> SuiteBoard {
+        #if DEBUG
+        if Demo.isOn {
+            let board = SuiteBoard(defaults: Demo.defaults, routingChanged: {})
+            let mic1 = VirtualMics.uidPrefix + "1"
+            let nodes: [(String, String, CGPoint)] = [
+                ("app:com.spotify.client", "Spotify", CGPoint(x: 20, y: 70)), ("app:com.apple.Safari", "Safari", CGPoint(x: 20, y: 230)),
+                ("in:demo.shure", "Shure MV7", CGPoint(x: 20, y: 400)),
+                ("out:demo.airpods", "AirPods Pro", CGPoint(x: 340, y: 40)), ("out:demo.display", "Studio Display Speakers", CGPoint(x: 340, y: 200)),
+                ("out:" + mic1, "Voidamp Mic 1", CGPoint(x: 340, y: 380)), ("app:com.hnc.Discord", "Discord", CGPoint(x: 660, y: 380))
+            ]
+            for (id, title, origin) in nodes {
+                board.place(SuiteItem(id: id, kind: id.hasPrefix("app:") ? .app : id.hasPrefix("in:") ? .input : .output, title: title, icon: nil, symbol: ""), at: origin)
+            }
+            return board
+        }
+        #endif
+        return SuiteBoard()
+    }
+}
+
+extension SuiteViewport {
+    static func forSuite() -> SuiteViewport {
+        #if DEBUG
+        if Demo.isOn { return SuiteViewport(defaults: Demo.defaults) }
+        #endif
+        return SuiteViewport()
     }
 }
 
@@ -233,6 +340,10 @@ final class RunningApps: ObservableObject {
     deinit { observers.forEach(NSWorkspace.shared.notificationCenter.removeObserver) }
 
     private func refresh() {
+        #if DEBUG
+        // The sample data's apps only.
+        if Demo.isOn { return }
+        #endif
         apps = NSWorkspace.shared.runningApplications.filter {
             guard $0.activationPolicy == .regular, let id = $0.bundleIdentifier else { return false }
             // Finder and Mail only play alerts, which System Sounds covers.
@@ -285,12 +396,12 @@ final class SuiteMeters: ObservableObject {
 
 struct SuiteView: View {
     @ObservedObject var audio: AudioController
-    @StateObject private var board = SuiteBoard()
+    @StateObject private var board = SuiteBoard.forSuite()
     @StateObject private var running = RunningApps()
     /// Held without observing: only the meters and wires redraw when levels change, not the whole editor.
     @State private var meters = SuiteMeters()
     /// Also held without observing: panning and zooming redraw the canvas, not the sidebar.
-    @State private var viewport = SuiteViewport()
+    @State private var viewport = SuiteViewport.forSuite()
 
     var body: some View {
         let catalog = makeCatalog()
@@ -413,7 +524,7 @@ private struct SuiteSidebar: View {
                     if board.placed[item.id] != nil {
                         Button("Remove from Board") { board.remove([item.id], audio: audio, catalog: catalog) }
                     } else {
-                        Button("Add to Board") { board.place(item, at: board.freeSpot(near: viewport.visibleCenter)) }
+                        Button("Add to Board") { board.add(item, at: board.freeSpot(near: viewport.visibleCenter), audio: audio) }
                     }
                     renameButton(item)
                     Divider()
@@ -470,7 +581,7 @@ private struct SuiteSidebar: View {
             if onBoard {
                 Button("Remove from Board") { board.remove([item.id], audio: audio, catalog: catalog) }
             } else {
-                Button("Add to Board") { board.place(item, at: board.freeSpot(near: viewport.visibleCenter)) }
+                Button("Add to Board") { board.add(item, at: board.freeSpot(near: viewport.visibleCenter), audio: audio) }
             }
             renameButton(item)
         }
@@ -612,7 +723,7 @@ private struct SuiteCanvas: View {
             Toggle(isOn: $audio.suiteEnabled) {
                 Text("Suite").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
             }
-            .help(audio.suiteEnabled ? "Turn the Suite off: wires and microphone monitoring pause, and apps play where they would without Voidamp. Your wiring is kept."
+            .help(audio.suiteEnabled ? "Turn the Suite off: wires and microphone monitoring pause, and apps play where they would without Voidamp. Your wiring is kept. System Sounds stay on the output macOS uses for alerts."
                                      : "Turn the Suite on to use your wiring again")
         }
         .toggleStyle(.switch)
@@ -625,7 +736,7 @@ private struct SuiteCanvas: View {
         if !audio.suiteEnabled || !audio.mixingEnabled {
             HStack(spacing: 8) {
                 Image(systemName: "pause.circle.fill").foregroundStyle(.secondary)
-                Text(audio.suiteEnabled ? "Mixing is off in the menu bar, so wires are paused." : "The Suite is off. Apps play on the default output.")
+                Text(audio.suiteEnabled ? "Mixing is off in the menu bar, so wires are paused." : "The Suite is off. Apps play where they would without Voidamp.")
                     .font(.system(size: 12))
                 if audio.suiteEnabled {
                     Button("Turn On Mixing") { audio.enableMixing() }.controlSize(.small)
@@ -646,6 +757,19 @@ private struct SuiteCanvas: View {
         if event.charactersIgnoringModifiers?.lowercased() == "a", flags.contains(.command) || flags.contains(.control),
            flags.isDisjoint(with: [.option, .shift]) {
             selectedNodes = Set(nodes.map(\.id)); selectedWire = nil
+            return true
+        }
+        // ⌘Z and ⇧⌘Z, also by the letter typed.
+        if event.charactersIgnoringModifiers?.lowercased() == "z", flags.contains(.command), flags.isDisjoint(with: [.option, .control]) {
+            let undo = SuiteWindowController.shared.undoManager
+            if flags.contains(.shift) {
+                guard undo.canRedo else { return false }
+                undo.redo()
+            } else {
+                guard undo.canUndo else { return false }
+                undo.undo()
+            }
+            selectedNodes = []; selectedWire = nil
             return true
         }
         switch event.keyCode {
@@ -728,8 +852,10 @@ private struct SuiteCanvas: View {
                         .onChanged { nodeDrag = (item.id, $0.translation) }
                         .onEnded { value in
                             if let origin = board.placed[item.id] {
-                                board.move(item.id, to: CGPoint(x: origin.x + value.translation.width / viewport.zoom,
-                                                                y: origin.y + value.translation.height / viewport.zoom))
+                                SuiteUndo.record("Move", board: board, audio: audio, nodes: [item.id]) {
+                                    board.move(item.id, to: CGPoint(x: origin.x + value.translation.width / viewport.zoom,
+                                                                    y: origin.y + value.translation.height / viewport.zoom))
+                                }
                             }
                             nodeDrag = nil
                         })
@@ -815,16 +941,17 @@ private struct SuiteCanvas: View {
 
     /// Places dropped items where they land. Wires are only ever made by dragging them.
     private func drop(_ ids: [String], at location: CGPoint) -> Bool {
-        var offset: CGFloat = 0
-        var placedAny = false
-        for id in ids {
-            guard let item = catalog.first(where: { $0.id == id }) else { continue }
-            let center = viewport.toBoard(location)
-            board.place(item, at: CGPoint(x: center.x - SuiteMetrics.nodeSize.width / 2 + offset, y: center.y - SuiteMetrics.nodeSize.height / 2 + offset))
-            offset += 24
-            placedAny = true
+        let items = ids.compactMap { id in catalog.first { $0.id == id } }
+        guard !items.isEmpty else { return false }
+        SuiteUndo.record(items.count == 1 ? "Add to Board" : "Add \(items.count) Items to Board", board: board, audio: audio, nodes: items.map(\.id)) {
+            var offset: CGFloat = 0
+            for item in items {
+                let center = viewport.toBoard(location)
+                board.place(item, at: CGPoint(x: center.x - SuiteMetrics.nodeSize.width / 2 + offset, y: center.y - SuiteMetrics.nodeSize.height / 2 + offset))
+                offset += 24
+            }
         }
-        return placedAny
+        return true
     }
 
     // MARK: Wiring
@@ -908,20 +1035,24 @@ private struct SuiteCanvas: View {
     private func connect(_ sourceID: String, _ outputID: String) {
         guard let output = audio.sources.first(where: { !$0.input && "out:" + $0.uid == outputID }),
               let item = catalog.first(where: { $0.id == sourceID }) else { return }
-        if item.kind == .app {
-            audio.connect(audio.appSource(id: item.key, name: item.title, icon: item.icon), to: output)
-        } else if let input = audio.sources.first(where: { $0.input && $0.uid == item.key }) {
-            audio.connect(input: input, to: output)
+        SuiteUndo.record("Connect", board: board, audio: audio, apps: item.kind == .app ? [item.key] : [], inputs: item.kind == .input ? [item.key] : []) {
+            if item.kind == .app {
+                audio.connect(audio.appSource(id: item.key, name: item.title, icon: item.icon), to: output)
+            } else if let input = audio.sources.first(where: { $0.input && $0.uid == item.key }) {
+                audio.connect(input: input, to: output)
+            }
         }
     }
 
     private func disconnect(_ wire: SuiteWire) {
         guard !wire.implicit, let item = catalog.first(where: { $0.id == wire.from }) else { return }
         let outputUID = String(wire.to.dropFirst(4))
-        if item.kind == .app {
-            audio.disconnect(audio.appSource(id: item.key, name: item.title, icon: item.icon), from: outputUID)
-        } else if let input = audio.sources.first(where: { $0.input && $0.uid == item.key }) {
-            audio.disconnect(input: input, from: outputUID)
+        SuiteUndo.record("Disconnect", board: board, audio: audio, apps: item.kind == .app ? [item.key] : [], inputs: item.kind == .input ? [item.key] : []) {
+            if item.kind == .app {
+                audio.disconnect(audio.appSource(id: item.key, name: item.title, icon: item.icon), from: outputUID)
+            } else if let input = audio.sources.first(where: { $0.input && $0.uid == item.key }) {
+                audio.disconnect(input: input, from: outputUID)
+            }
         }
     }
 
@@ -1379,6 +1510,8 @@ private struct SuiteVirtualMicNode: View {
         users.isEmpty ? "Virtual mic · no app uses it yet" : "Heard by " + users.joined(separator: ", ")
     }
     private var hint: String {
-        users.isEmpty ? "Choose “\(audio.displayName(output))” as the mic in an app" : "Wire a mic or an app into it"
+        let fed = audio.feedCount(intoMic: output.uid)
+        if users.isEmpty { return "Choose “\(audio.displayName(output))” as the mic in an app" }
+        return fed == 0 ? "Wire a mic or an app into it" : fed == 1 ? "1 source wired in" : "\(fed) sources wired in"
     }
 }

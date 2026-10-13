@@ -71,13 +71,16 @@ final class VirtualMics: ObservableObject {
         alert.addButton(withTitle: "Cancel")
         NSApplication.shared.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        // Wires into the virtual mics go too; otherwise an app sent only to a call would fall back to the speakers.
+        guard run("rm -rf \(quoted(Self.installed.path)) && (killall coreaudiod || true)", prompt: "Voidamp wants to remove its virtual microphones.") else { return }
+        // Wires into the virtual mics go too, once they're gone; otherwise an app sent only to a call would fall back
+        // to the speakers.
         for index in 1...2 { VoidampRuntime.shared.audio.clearWiring(output: Self.uidPrefix + String(index)) }
-        run("rm -rf \(quoted(Self.installed.path)) && (killall coreaudiod || true)", prompt: "Voidamp wants to remove its virtual microphones.")
     }
 
-    /// Runs a shell command as administrator through macOS's own password prompt.
-    private func run(_ command: String, prompt: String) {
+    /// Runs a shell command as administrator through macOS's own password prompt. False when it failed or the
+    /// password prompt was cancelled.
+    @discardableResult
+    private func run(_ command: String, prompt: String) -> Bool {
         let escape = { (text: String) in text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
         let source = "do shell script \"\(escape(command))\" with administrator privileges with prompt \"\(escape(prompt))\""
         var error: NSDictionary?
@@ -89,6 +92,7 @@ final class VirtualMics: ObservableObject {
         refresh()
         // The audio system takes a moment to come back with the new devices.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { VoidampRuntime.shared.audio.refresh() }
+        return error == nil
     }
 
     private func quoted(_ path: String) -> String { "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'" }

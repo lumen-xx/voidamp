@@ -5,7 +5,12 @@ import Combine
 @MainActor
 final class VoidampRuntime: ObservableObject {
     static let shared = VoidampRuntime()
-    let audio = AudioController()
+    let audio: AudioController = {
+        #if DEBUG
+        if Demo.isOn { return .demo() }
+        #endif
+        return AudioController()
+    }()
     let updater = AppUpdater()
     let loginItem = LoginItem()
     /// Set once the menu bar icon exists.
@@ -34,8 +39,40 @@ final class VoidampRuntime: ObservableObject {
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem("Check for Updates…", enabled: updater.canCheckForUpdates) { [updater] in updater.checkForUpdates() })
         menu.addItem(.separator())
-        menu.addItem(ClosureMenuItem("Quit Voidamp") { [audio] in audio.shutDown(); NSApplication.shared.terminate(nil) })
+        menu.addItem(ClosureMenuItem("Quit Voidamp") { NSApplication.shared.terminate(nil) })
         return menu
+    }
+
+    /// Asks before quitting while apps record from a virtual mic Voidamp is feeding: without Voidamp they hear
+    /// silence. Logging out, restarting and installing an update quit without asking.
+    func shouldQuit() -> Bool {
+        if updater.relaunching || Self.systemIsQuittingEverything { return true }
+        let listeners = audio.virtualMicListeners
+        guard !listeners.isEmpty else { return true }
+        closePanel()
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Quit Voidamp?"
+        let using = listeners.map { "\(Self.list($0.apps)) \($0.apps.count == 1 ? "is" : "are") using \($0.mic)" }
+        let apps = Self.list(listeners.flatMap(\.apps))
+        alert.informativeText = "\(Self.list(using)). Once Voidamp quits, \(apps) \(listeners.flatMap(\.apps).count == 1 ? "hears" : "hear") silence there until you open Voidamp again."
+        alert.addButton(withTitle: "Quit")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    /// "A", "A and B", "A, B and C".
+    private static func list(_ items: [String]) -> String {
+        guard items.count > 1 else { return items.first ?? "" }
+        return items.dropLast().joined(separator: ", ") + " and " + items[items.count - 1]
+    }
+
+    /// Whether macOS asked Voidamp to quit because the Mac is logging out, restarting or shutting down: its quit
+    /// event then carries a reason.
+    private static var systemIsQuittingEverything: Bool {
+        guard let event = NSAppleEventManager.shared().currentAppleEvent, event.eventClass == AEEventClass(kCoreEventClass),
+              event.eventID == AEEventID(kAEQuitApplication) else { return false }
+        return event.attributeDescriptor(forKeyword: AEKeyword(kAEQuitReason)) != nil
     }
 
     /// Saved setups of devices, levels, mutes and the Suite's app wiring.
@@ -132,28 +169,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // window number. --muted shows Sound and Mic as muted without muting any device.
         if CommandLine.arguments.contains("--panel-preview") {
             let suite = "app.voidamp.preview.\(UUID().uuidString)"
-            let audio = AudioController(preferences: UserDefaults(suiteName: suite)!, autoStartMixing: false)
-            // Stop the controller's refresh first: with the flags set, it would mute every real device.
-            audio.shutDown()
+            let audio = Demo.isOn ? .demo() : AudioController(preferences: UserDefaults(suiteName: suite)!, autoStartMixing: false)
+            // Stop the controller's refresh first: with the flags set, it would mute every real device. The sample
+            // data is already stopped, and stopping again would turn its mixing off.
+            if !Demo.isOn { audio.shutDown() }
             if CommandLine.arguments.contains("--muted") { audio.soundMuted = true; audio.micMuted = true }
             let runtime = VoidampRuntime.shared
             let host = NSHostingView(rootView: MixerView(audio: audio, updater: runtime.updater, loginItem: runtime.loginItem).padding(20))
             host.frame.size = host.fittingSize
-            let window = NSPanel(contentRect: host.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            let window = PreviewPanel(contentRect: host.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             window.isOpaque = false; window.backgroundColor = .clear; window.level = .floating
             window.appearance = NSAppearance(named: CommandLine.arguments.contains("--light") ? .aqua : .darkAqua)
             window.contentView = host
             window.setFrameOrigin(NSPoint(x: 200, y: 300)); window.orderFrontRegardless()
+            // Key, so switches and sliders show their colours as in the real panel.
+            NSApplication.shared.setActivationPolicy(.regular)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                NSApplication.shared.activate(ignoringOtherApps: true)
+                window.makeKeyAndOrderFront(nil)
+            }
             previewWindow = window
             print("window \(window.windowNumber)"); fflush(stdout)
             DispatchQueue.main.asyncAfter(deadline: .now() + 6) { exit(0) }
             return
         }
-        // `--suite-preview` opens only the Suite, for screenshots, and prints its window number.
+        // `--suite-preview` opens only the Suite, for screenshots, and prints its window number. With `--demo`, the
+        // panel and the Suite show sample apps, devices and wiring instead of this Mac's.
         if CommandLine.arguments.contains("--suite-preview") {
             // `--settings` opens it on the Settings tab.
             SuiteWindowController.shared.show(tab: CommandLine.arguments.contains("--settings") ? .settings : nil)
             if let number = SuiteWindowController.shared.windowNumber { print("window \(number)"); fflush(stdout) }
+            // `--try-quit` then asks to quit, as the Quit menu item does, and prints the window number of any question.
+            if CommandLine.arguments.contains("--try-quit") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                    let timer = Timer(timeInterval: 0.5, repeats: true) { _ in
+                        MainActor.assumeIsolated {
+                            if let alert = NSApplication.shared.modalWindow { print("alert \(alert.windowNumber)"); fflush(stdout) }
+                        }
+                    }
+                    RunLoop.main.add(timer, forMode: .modalPanel)
+                    NSApplication.shared.terminate(nil)
+                }
+            }
             return
         }
         #endif
@@ -303,12 +360,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return false
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        VoidampRuntime.shared.shouldQuit() ? .terminateNow : .terminateCancel
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         if let outsideClickMonitor { NSEvent.removeMonitor(outsideClickMonitor) }
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         VoidampRuntime.shared.audio.shutDown()
     }
 }
+
+#if DEBUG
+/// The panel preview's window, which may become key like the real panel's popover.
+private final class PreviewPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+#endif
 
 private final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -438,7 +506,56 @@ struct VoidampApp: App {
             let hidden = AudioController(preferences: preferences, autoStartMixing: false)
             precondition(!hidden.showSystemSounds, "System Sounds setting not saved")
             hidden.shutDown()
-            print("PASS: stable device order, profile persistence/deletion, 100% snapping, gain bounds, System Sounds setting, delay line, profile names")
+            // Undo in the Suite: a snapshot puts wiring back exactly, also after an output's wires were cleared.
+            // Mixing is off in this controller, so no route is made.
+            if let output = controller.sources.first(where: { !$0.input }) {
+                let app = controller.appSource(id: "check.app", name: "Check", icon: nil)
+                let before = controller.wiringSnapshot(apps: [app.id])
+                controller.connect(app, to: output)
+                let after = controller.wiringSnapshot(like: before)
+                controller.restore(before)
+                precondition(controller.wiredOutputs(app).isEmpty, "undo connect")
+                controller.restore(after)
+                precondition(controller.wiredOutputs(app) == [output.uid], "redo connect")
+                let wired = controller.wiringSnapshot(outputs: [output.uid])
+                precondition(wired.apps[app.id] == [output.uid], "snapshot by output")
+                controller.clearWiring(output: output.uid)
+                precondition(controller.wiredOutputs(app).isEmpty, "output cleared")
+                controller.restore(wired)
+                precondition(controller.wiredOutputs(app) == [output.uid], "undo removing an output")
+                controller.clearWiring(app)
+                // The same through the Suite's undo, on a board kept in the check's own preferences.
+                let board = SuiteBoard(defaults: preferences, routingChanged: {})
+                let undo = SuiteWindowController.shared.undoManager
+                undo.groupsByEvent = false
+                func step(_ change: () -> Void) { undo.beginUndoGrouping(); change(); undo.endUndoGrouping() }
+                let appItem = SuiteItem(id: "app:check.app", kind: .app, title: "Check", icon: nil, symbol: "app.dashed")
+                let outputItem = SuiteItem(id: "out:" + output.uid, kind: .output, title: output.name, icon: nil, symbol: "hifispeaker")
+                step { board.add(appItem, at: .zero, audio: controller) }
+                step { board.add(outputItem, at: CGPoint(x: 300, y: 0), audio: controller) }
+                step { SuiteUndo.record("Connect", board: board, audio: controller, apps: [app.id]) { controller.connect(app, to: output) } }
+                step { board.remove([appItem.id, outputItem.id], audio: controller, catalog: [appItem, outputItem]) }
+                precondition(board.placed.isEmpty && controller.wiredOutputs(app).isEmpty, "removed with wires")
+                undo.undo()
+                precondition(board.placed[appItem.id] == .zero && board.placed[outputItem.id] == CGPoint(x: 300, y: 0) && board.names[appItem.id] == "Check", "undo puts nodes back")
+                precondition(controller.wiredOutputs(app) == [output.uid], "undo puts wires back")
+                undo.redo()
+                precondition(board.placed.isEmpty && controller.wiredOutputs(app).isEmpty, "redo removes again")
+                undo.undo(); undo.undo()
+                precondition(board.placed.count == 2 && controller.wiredOutputs(app).isEmpty, "undo connect")
+                undo.undo(); undo.undo()
+                precondition(board.placed.isEmpty && !undo.canUndo, "undo every step")
+                undo.removeAllActions()
+                controller.clearWiring(app)
+            }
+            // Media keys: Option alone goes to macOS; volume keys need a settable output; brightness keys the built-in display.
+            precondition(MediaKeyTap.takes(NX_KEYTYPE_SOUND_UP, option: false, shift: false, volumeAdjustable: true) { false })
+            precondition(!MediaKeyTap.takes(NX_KEYTYPE_SOUND_UP, option: true, shift: false, volumeAdjustable: true) { false })
+            precondition(MediaKeyTap.takes(NX_KEYTYPE_MUTE, option: true, shift: true, volumeAdjustable: true) { false })
+            precondition(!MediaKeyTap.takes(NX_KEYTYPE_SOUND_DOWN, option: false, shift: false, volumeAdjustable: false) { true })
+            precondition(MediaKeyTap.takes(NX_KEYTYPE_BRIGHTNESS_UP, option: false, shift: false, volumeAdjustable: false) { true })
+            precondition(!MediaKeyTap.takes(NX_KEYTYPE_BRIGHTNESS_DOWN, option: false, shift: false, volumeAdjustable: true) { false })
+            print("PASS: stable device order, profile persistence/deletion, 100% snapping, gain bounds, System Sounds setting, delay line, profile names, Suite undo, media keys")
             for source in controller.sources { print("\(source.input ? "Input" : "Output"): \(source.name) · \(source.channels.count) volume controls") }
             for app in controller.apps { print("App: \(app.name)") }
             controller.shutDown(); reloaded.shutDown(); deleted.shutDown()
