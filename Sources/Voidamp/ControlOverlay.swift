@@ -198,7 +198,7 @@ final class ControlOverlay {
         // A drag SwiftUI cancelled without ending: the button is up, so show the pointer again.
         if model.dragging, NSEvent.pressedMouseButtons == 0 { model.dragging = false }
         let pointer = NSEvent.mouseLocation
-        let card = window.frame.insetBy(dx: 20, dy: 20)
+        let card = window.frame.insetBy(dx: OverlayCard.margin, dy: OverlayCard.margin)
         // A pointer that was already resting where the card appeared doesn't count until it moves.
         guard NSMouseInRect(pointer, card, false), pointer != pointerAtShow else {
             restingSince = nil
@@ -377,7 +377,7 @@ final class OverlayModel: ObservableObject {
 @MainActor
 final class OverlayWindow: NSPanel {
     init(model: OverlayModel) {
-        super.init(contentRect: NSRect(x: 0, y: 0, width: OverlayCard.size.width + 40, height: OverlayCard.size.height + 40),
+        super.init(contentRect: NSRect(x: 0, y: 0, width: OverlayCard.size.width + OverlayCard.margin * 2, height: OverlayCard.size.height + OverlayCard.margin * 2),
                    styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
         isOpaque = false
         backgroundColor = .clear
@@ -387,7 +387,7 @@ final class OverlayWindow: NSPanel {
         ignoresMouseEvents = true
         collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         isReleasedWhenClosed = false
-        let host = OverlayHostingView(rootView: OverlayCard(model: model).padding(20))
+        let host = OverlayHostingView(rootView: OverlayCard(model: model).padding(OverlayCard.margin))
         host.frame = contentRect(forFrameRect: frame)
         contentView = host
     }
@@ -399,8 +399,8 @@ final class OverlayWindow: NSPanel {
         let size = frame.size
         // The visible frame stops below the menu bar; with the menu bar hidden, the notch's safe area still counts.
         let top = min(screen.visibleFrame.maxY, screen.frame.maxY - screen.safeAreaInsets.top)
-        // The card sits 8 pt below that, inside the window's 20 pt margin.
-        setFrameOrigin(NSPoint(x: (screen.frame.midX - size.width / 2).rounded(), y: (top - 8 + 20 - size.height).rounded()))
+        // The card sits 8 pt below that, inside the window's margin.
+        setFrameOrigin(NSPoint(x: (screen.frame.midX - size.width / 2).rounded(), y: (top - 8 + OverlayCard.margin - size.height).rounded()))
     }
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
@@ -415,6 +415,8 @@ private final class OverlayHostingView<Content: View>: NSHostingView<Content> {
 /// can be dragged or clicked and the card stays up; clicking the speaker mutes.
 struct OverlayCard: View {
     static let size = CGSize(width: 240, height: 48)
+    /// Transparent room around the card inside its window, wide enough for the whole shadow (radius 14, 6 pt down).
+    static let margin: CGFloat = 40
     @ObservedObject var model: OverlayModel
     @Environment(\.colorScheme) private var scheme
     /// One fixed ink per appearance. Liquid Glass adapts semantic colours to whatever is behind the card, which
