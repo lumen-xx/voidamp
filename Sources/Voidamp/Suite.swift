@@ -164,6 +164,10 @@ final class SuiteViewport: ObservableObject {
     @Published var pan: CGSize
     /// The canvas size, kept by the canvas, for placing new nodes in view and fitting.
     var size = CGSize(width: 800, height: 600)
+    #if DEBUG
+    /// A wire the demo video drags from one node to another, `progress` of the way.
+    @Published var demoDrag: (from: String, to: String, progress: CGFloat)?
+    #endif
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
@@ -316,7 +320,11 @@ extension SuiteBoard {
 extension SuiteViewport {
     static func forSuite() -> SuiteViewport {
         #if DEBUG
-        if Demo.isOn { return SuiteViewport(defaults: Demo.defaults) }
+        if Demo.isOn {
+            let viewport = SuiteViewport(defaults: Demo.defaults)
+            Demo.viewport = viewport
+            return viewport
+        }
         #endif
         return SuiteViewport()
     }
@@ -674,6 +682,15 @@ private struct SuiteCanvas: View {
                     .position(SuiteWires.midpoint(from: SuiteWires.start(from), to: SuiteWires.end(to)))
                 }
                 if nodes.isEmpty { emptyState.frame(width: geometry.size.width, height: geometry.size.height) }
+                #if DEBUG
+                // The demo video's pointer, at the end of the wire it drags.
+                if let line = pendingLine(frames), viewport.demoDrag != nil {
+                    let arrow = NSCursor.arrow
+                    Image(nsImage: arrow.image)
+                        .position(x: line.1.x + arrow.image.size.width / 2 - arrow.hotSpot.x, y: line.1.y + arrow.image.size.height / 2 - arrow.hotSpot.y)
+                        .allowsHitTesting(false)
+                }
+                #endif
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
             .clipped()
@@ -842,7 +859,7 @@ private struct SuiteCanvas: View {
         let size = SuiteMetrics.nodeSize
         return nodeContent(item, wires: wires)
             .frame(width: size.width, height: size.height)
-            .modifier(SuiteNodeSurface(highlighted: hoveredTarget == item.id || selectedNodes.contains(item.id)))
+            .modifier(SuiteNodeSurface(highlighted: hoveredTarget == item.id || selectedNodes.contains(item.id) || demoTarget == item.id))
             .overlay(alignment: .top) {
                 // The top strip moves the node.
                 // The top strip selects the node on click and moves it on drag.
@@ -918,6 +935,14 @@ private struct SuiteCanvas: View {
     // MARK: Geometry
 
     private func screenFrame(_ id: String) -> CGRect? { board.placed[id].map { viewport.screenFrame(origin: $0) } }
+
+    /// The node the demo video's wire is about to land on.
+    private var demoTarget: String? {
+        #if DEBUG
+        if let drag = viewport.demoDrag, drag.progress > 0.85 { return drag.to }
+        #endif
+        return nil
+    }
 
     private func screenFrames(_ nodes: [SuiteItem]) -> [String: CGRect] {
         var frames: [String: CGRect] = [:]
@@ -1028,6 +1053,12 @@ private struct SuiteCanvas: View {
     }
 
     private func pendingLine(_ frames: [String: CGRect]) -> (CGPoint, CGPoint)? {
+        #if DEBUG
+        if let drag = viewport.demoDrag, let from = frames[drag.from], let to = frames[drag.to] {
+            let start = SuiteWires.start(from), end = SuiteWires.end(to)
+            return (start, CGPoint(x: start.x + (end.x - start.x) * drag.progress, y: start.y + (end.y - start.y) * drag.progress))
+        }
+        #endif
         guard let pending, let frame = frames[pending.from] else { return nil }
         return pending.fromLeft ? (pending.point, SuiteWires.end(frame)) : (SuiteWires.start(frame), pending.point)
     }

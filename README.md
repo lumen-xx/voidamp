@@ -103,7 +103,7 @@ swift build
 
 The read-only audio self-check also uses an isolated preferences domain to verify profile persistence/deletion, stable device ordering, gain bounds, the 100% snap behavior, undo and redo on the Suite's board with its wiring, and which volume and brightness keys Voidamp takes.
 
-The README images come from sample data in development builds, never from this Mac's apps or devices: `.build/debug/Voidamp --suite-preview --demo` and `--panel-preview --demo` print a window number for `screencapture -l`, `--overlay-snapshot <png> --clear` renders the volume cards, and `swift scripts/marketing.swift <out.png> <headline> <subtitle> <icon.png> <image.png>...` puts them on the background. App playback routing requires separate live verification with system audio permission.
+The README images come from sample data in development builds, never from this Mac's apps or devices: `.build/debug/Voidamp --suite-preview --demo` and `--panel-preview --demo` print a window number for `screencapture -l`, `--overlay-snapshot <png> --clear` renders the volume cards, and `swift scripts/marketing.swift <out.png> <headline> <subtitle> <icon.png> <image.png>...` puts them on the background. `docs/demo.mp4`, the 7-second clip for announcements, is recorded with `--suite-preview --demo --demo-play` and `swift scripts/demo-video.swift <pid> <window number> 7 <out.mp4> <headline> <subtitle> <icon.png> <patch.png>`; it captures only that window. App playback routing requires separate live verification with system audio permission.
 
 Open `Package.swift` in Xcode to edit. Uses Sparkle for signed app updates. See [updates/README.md](updates/README.md) for release preparation, signing, and publishing.
 

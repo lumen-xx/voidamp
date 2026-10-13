@@ -199,6 +199,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // `--settings` opens it on the Settings tab.
             SuiteWindowController.shared.show(tab: CommandLine.arguments.contains("--settings") ? .settings : nil)
             if let number = SuiteWindowController.shared.windowNumber { print("window \(number)"); fflush(stdout) }
+            Demo.waitToPlay()
             // `--try-quit` then asks to quit, as the Quit menu item does, and prints the window number of any question.
             if CommandLine.arguments.contains("--try-quit") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) {

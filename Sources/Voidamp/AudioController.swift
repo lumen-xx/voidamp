@@ -609,6 +609,10 @@ extension AudioController {
     }
 
     private func updateRoutes(live: Set<AudioObjectID>, now: Date) {
+        #if DEBUG
+        // The sample data of `--demo` never builds real routes.
+        if demoLevels != nil { return }
+        #endif
         guard mixingEnabled else {
             routes.removeAll()
             return
@@ -1130,6 +1134,9 @@ extension AudioController {
 
     /// Starts and stops monitors to match the wiring and the devices present.
     func updateMonitors() {
+        #if DEBUG
+        if demoLevels != nil { return }
+        #endif
         var wanted: [RouteKey: (AudioSource, AudioSource)] = [:]
         for (inputUID, outputUIDs) in monitorWiring where suiteEnabled && mixingEnabled {
             guard let input = sources.first(where: { $0.input && $0.uid == inputUID }) else { continue }
@@ -1176,7 +1183,11 @@ extension AudioController {
     /// directly, without a route, have no reading.
     func takePeaks() -> (sources: [String: Float], outputs: [String: Float]) {
         #if DEBUG
-        if let demoLevels { return (demoLevels.sources.mapValues { $0 * .random(in: 0.8...1) }, demoLevels.outputs.mapValues { $0 * .random(in: 0.8...1) }) }
+        // Louder apps read louder, so a raised slider shows on the meters.
+        if let demoLevels {
+            let sources = Dictionary(uniqueKeysWithValues: demoLevels.sources.map { id, level in (id, level * Float(appSettings[id]?.gain ?? 1) * .random(in: 0.8...1)) })
+            return (sources, demoLevels.outputs.mapValues { $0 * .random(in: 0.8...1) })
+        }
         #endif
         var bySource: [String: Float] = [:]
         var byOutput: [String: Float] = [:]
@@ -1388,7 +1399,7 @@ extension AudioController {
         audio.inputUsers = [9004: [InputUser(id: "com.hnc.Discord", name: "Discord")]]
         audio.alertDevice = 9002
         audio.mixingEnabled = true
-        audio.demoLevels = (["com.spotify.client": 0.5, "com.apple.Safari": 0.22, "com.brave.Browser": 0.12, "demo.shure": 0.35],
+        audio.demoLevels = (["com.spotify.client": 0.35, "com.apple.Safari": 0.22, "com.brave.Browser": 0.12, "demo.shure": 0.35],
                             ["demo.airpods": 0.5, "demo.display": 0.22, mic1: 0.55])
         return audio
     }
