@@ -61,4 +61,7 @@ if ! codesign -d --requirements - "$APP" 2>&1 | grep -q "certificate leaf = H\"$
     exit 1
 fi
 codesign --verify --deep --strict "$APP"
+# macOS caches app icons by the date of the Voidamp.app folder, which the steps above never change. Without this,
+# Finder, the Dock and Raycast keep showing an old icon after an update.
+touch "$APP"
 echo "Built $APP ($VERSION, build $BUILD)"
