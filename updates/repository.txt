@@ -1,1 +1,1 @@
-lumen-xx/voidamp-releases
+lumen-xx/voidamp

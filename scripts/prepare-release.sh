@@ -16,12 +16,17 @@ if gh release view "v$VERSION" --repo "$REPOSITORY" >/dev/null 2>&1; then
     exit 1
 fi
 rm -f "$RELEASE_DIR/appcast.xml"
-# Retain previous signed feed entries without editing their signed contents. Only a repository without releases
-# starts a new feed: any other error (signed out, offline) stops here, or the build-number check below is skipped.
-if LATEST="$(gh release view --repo "$REPOSITORY" --json tagName --jq .tagName 2>&1)"; then
-    gh release download --repo "$REPOSITORY" --pattern appcast.xml --dir "$RELEASE_DIR" --clobber
+# Retain previous signed feed entries without editing their signed contents. Until the source repository has a
+# release, the feed continues from the old releases repository. Only a repository without releases counts as
+# empty: any other error (signed out, offline) stops here, or the build-number check below is skipped.
+FEED_REPOSITORY="$REPOSITORY"
+if ! LATEST="$(gh release view --repo "$FEED_REPOSITORY" --json tagName --jq .tagName 2>&1)" && [ -f updates/legacy-repository.txt ]; then
+    FEED_REPOSITORY="$(cat updates/legacy-repository.txt)"
+fi
+if LATEST="$(gh release view --repo "$FEED_REPOSITORY" --json tagName --jq .tagName 2>&1)"; then
+    gh release download --repo "$FEED_REPOSITORY" --pattern appcast.xml --dir "$RELEASE_DIR" --clobber
 elif [[ "$LATEST" != *"release not found"* ]]; then
-    echo "Couldn't read the latest release of $REPOSITORY: $LATEST" >&2
+    echo "Couldn't read the latest release of $FEED_REPOSITORY: $LATEST" >&2
     exit 1
 fi
 # Sparkle only offers a higher build number, and the bundle must say the version being released.

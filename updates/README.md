@@ -1,6 +1,6 @@
 # Signed updates
 
-Voidamp uses Sparkle 2.10.0. The private source repository is `lumen-xx/voidamp`; public binaries and the signed feed are published to `lumen-xx/voidamp-releases`. The repository was renamed from `voidmap-releases` on 2026-10-10; GitHub redirects the old feed and download addresses, which builds up to 1.1.14 still use. Do not create a new repository named `voidmap-releases`, or those redirects stop working.
+Voidamp uses Sparkle 2.10.0. Source, binaries and the signed feed are all in `lumen-xx/voidamp`; the feed is the `appcast.xml` asset of the latest release. Builds up to 1.1.36 read the feed of `lumen-xx/voidamp-releases` (`updates/legacy-repository.txt`), and builds up to 1.1.14 reach it through that repository's old name, `voidmap-releases`, which GitHub redirects. Publishing therefore also creates a release there that carries only the new signed feed. Don't delete or rename `voidamp-releases`, and don't create a repository named `voidmap-releases`, or those copies stop getting updates.
 
 The public key in `public-key.txt` is safe to commit. The private Ed25519 signing key stays in the local macOS login Keychain under account `app.voidamp.mac.updates`. Never export it into the repository or release assets. Back up the login Keychain securely: future releases must use this same key.
 

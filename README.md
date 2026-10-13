@@ -12,7 +12,7 @@ A small macOS menu bar mixer for your apps, speakers, and microphones. Adjust Sa
 
 ## Install
 
-1. Download the [latest release](https://github.com/lumen-xx/voidamp-releases/releases/latest), unzip it, and move **Voidamp.app** to **Applications**.
+1. Download the [latest release](https://github.com/lumen-xx/voidamp/releases/latest), unzip it, and move **Voidamp.app** to **Applications**.
 2. Open it. If blocked, go to **System Settings → Privacy & Security → Open Anyway**, or run:
 
 ```sh
@@ -108,3 +108,7 @@ The README images come from sample data in development builds, never from this M
 Open `Package.swift` in Xcode to edit. Uses Sparkle for signed app updates. See [updates/README.md](updates/README.md) for release preparation, signing, and publishing.
 
 Apple reference: [Capturing system audio with Core Audio taps](https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps).
+
+## License
+
+[MIT](LICENSE). Voidamp bundles Sparkle 2.10.0 under its MIT license.

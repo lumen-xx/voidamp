@@ -107,10 +107,10 @@ struct SuiteSettings: View {
                 // section footers, so this is a row.
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 10) {
-                        Link("GitHub", destination: URL(string: "https://github.com/lumen-xx/voidamp-releases")!)
+                        Link("GitHub", destination: URL(string: "https://github.com/lumen-xx/voidamp")!)
                         Link("opyuii.com", destination: URL(string: "https://opyuii.com")!)
                     }
-                    Text("© \(String(Calendar.current.component(.year, from: Date()))) opyuii. All rights reserved.")
+                    Text("© \(String(Calendar.current.component(.year, from: Date()))) opyuii · MIT License")
                         .foregroundStyle(.secondary)
                 }
                 .font(.system(size: 11))
