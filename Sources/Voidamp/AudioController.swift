@@ -797,6 +797,8 @@ extension AudioController {
         persistProfiles()
     }
     func applyProfile(_ profile: MixerProfile) {
+        // The profile replaces the Suite's wiring; undoing an earlier board change would bring the old wiring back.
+        SuiteWindowController.shared.undoManager.removeAllActions()
         if profile.mixingEnabled == false { disableMixing() }
         if soundMuted { toggleSoundMute() }
         if micMuted { toggleMicMute() }
@@ -1273,7 +1275,9 @@ extension AudioController {
     func canMute(_ output: AudioSource) -> Bool { output.hasMuteSwitch || !output.channels.isEmpty }
     func isMuted(_ output: AudioSource) -> Bool {
         let live = sources.first(where: { $0.id == output.id }) ?? output
-        return live.hasMuteSwitch ? live.hardwareMuted : !live.channels.isEmpty && live.volume == 0
+        // Without a switch, an output is muted when the level it returns to is 0; while the Sound button holds it at
+        // 0, that's the level it had before.
+        return live.hasMuteSwitch ? live.hardwareMuted : !live.channels.isEmpty && displayVolume(live) == 0
     }
     func toggleMute(output: AudioSource) {
         let live = sources.first(where: { $0.id == output.id }) ?? output
@@ -1285,14 +1289,18 @@ extension AudioController {
 // MARK: Undo and quitting
 
 /// The Suite's wiring for some apps and microphones, so a change to it can be undone exactly.
-struct WiringSnapshot {
+struct WiringSnapshot: Equatable {
+    struct Alerts: Equatable {
+        let output: String
+        let before: String
+    }
     /// App id → the outputs it is wired to, in order.
     var apps: [String: [String]] = [:]
     /// Input UID → the outputs it is played on.
     var monitors: [String: [String]] = [:]
     /// Whether System Sounds' wire is part of it, and where the Suite had moved them (with the device before).
     var coversAlerts = false
-    var alerts: (output: String, before: String)?
+    var alerts: Alerts?
 }
 
 extension AudioController {
@@ -1305,7 +1313,7 @@ extension AudioController {
         for id in Set(inputs).union(monitorWiring.filter { !outputs.isDisjoint(with: $0.value) }.keys) { snapshot.monitors[id] = monitorWiring[id] ?? [] }
         if apps.contains(AppSource.systemSoundsID) {
             snapshot.coversAlerts = true
-            if let before = alertBeforeSuite, let output = alertOutput { snapshot.alerts = (output.uid, before) }
+            if let before = alertBeforeSuite, let output = alertOutput { snapshot.alerts = .init(output: output.uid, before: before) }
         }
         return snapshot
     }
@@ -1363,6 +1371,9 @@ extension AudioController {
     /// samples go in, and with no routes or monitors nothing reaches a real device.
     static func demo() -> AudioController {
         let suite = "app.voidamp.demo"
+        // Cleared first: a mute saved by an earlier preview (`--muted`) would otherwise mute every real device when
+        // the new controller starts.
+        UserDefaults.standard.removePersistentDomain(forName: suite)
         let audio = AudioController(preferences: UserDefaults(suiteName: suite)!, autoStartMixing: false)
         audio.shutDown()
         UserDefaults.standard.removePersistentDomain(forName: suite)

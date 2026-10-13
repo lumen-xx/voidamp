@@ -54,8 +54,9 @@ final class VoidampRuntime: ObservableObject {
         let alert = NSAlert()
         alert.messageText = "Quit Voidamp?"
         let using = listeners.map { "\(Self.list($0.apps)) \($0.apps.count == 1 ? "is" : "are") using \($0.mic)" }
-        let apps = Self.list(listeners.flatMap(\.apps))
-        alert.informativeText = "\(Self.list(using)). Once Voidamp quits, \(apps) \(listeners.flatMap(\.apps).count == 1 ? "hears" : "hear") silence there until you open Voidamp again."
+        // An app using both virtual mics is named once.
+        let names = listeners.flatMap(\.apps).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+        alert.informativeText = "\(Self.list(using)). Once Voidamp quits, \(Self.list(names)) \(names.count == 1 ? "hears" : "hear") silence there until you open Voidamp again."
         alert.addButton(withTitle: "Quit")
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
@@ -535,6 +536,8 @@ struct VoidampApp: App {
                 step { board.add(appItem, at: .zero, audio: controller) }
                 step { board.add(outputItem, at: CGPoint(x: 300, y: 0), audio: controller) }
                 step { SuiteUndo.record("Connect", board: board, audio: controller, apps: [app.id]) { controller.connect(app, to: output) } }
+                // Connecting again changes nothing, so it registers nothing; outside a group, registering would raise.
+                SuiteUndo.record("Connect", board: board, audio: controller, apps: [app.id]) { controller.connect(app, to: output) }
                 step { board.remove([appItem.id, outputItem.id], audio: controller, catalog: [appItem, outputItem]) }
                 precondition(board.placed.isEmpty && controller.wiredOutputs(app).isEmpty, "removed with wires")
                 undo.undo()

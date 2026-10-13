@@ -257,7 +257,7 @@ extension SuiteBoard {
         SuiteUndo.record("Add to Board", board: self, audio: audio, nodes: [item.id]) { place(item, at: origin) }
     }
 
-    struct Placement {
+    struct Placement: Equatable {
         let origin: CGPoint
         let name: String?
     }
@@ -267,7 +267,7 @@ extension SuiteBoard {
 /// puts back the earlier state of just those.
 @MainActor
 enum SuiteUndo {
-    private struct State {
+    private struct State: Equatable {
         let layout: [String: SuiteBoard.Placement?]
         let wiring: WiringSnapshot
     }
@@ -277,6 +277,8 @@ enum SuiteUndo {
         let before = State(layout: board.layout(nodes), wiring: audio.wiringSnapshot(apps: apps, inputs: inputs, outputs: outputs))
         change()
         let after = State(layout: board.layout(nodes), wiring: audio.wiringSnapshot(like: before.wiring))
+        // A change that changed nothing (a wire that already existed, a node dropped where it was) isn't a step.
+        guard after != before else { return }
         register(name, board: board, audio: audio, back: before, forward: after)
     }
 
@@ -776,8 +778,9 @@ private struct SuiteCanvas: View {
             selectedNodes = Set(nodes.map(\.id)); selectedWire = nil
             return true
         }
-        // ⌘Z and ⇧⌘Z, also by the letter typed.
+        // ⌘Z and ⇧⌘Z, also by the letter typed. Not in the middle of a drag, which could lose its node.
         if event.charactersIgnoringModifiers?.lowercased() == "z", flags.contains(.command), flags.isDisjoint(with: [.option, .control]) {
+            if nodeDrag != nil || pending != nil { return true }
             let undo = SuiteWindowController.shared.undoManager
             if flags.contains(.shift) {
                 guard undo.canRedo else { return false }
@@ -1064,7 +1067,9 @@ private struct SuiteCanvas: View {
     }
 
     private func connect(_ sourceID: String, _ outputID: String) {
-        guard let output = audio.sources.first(where: { !$0.input && "out:" + $0.uid == outputID }),
+        // Only between nodes on the board; a wire you can't see would route audio unseen.
+        guard board.placed[sourceID] != nil, board.placed[outputID] != nil,
+              let output = audio.sources.first(where: { !$0.input && "out:" + $0.uid == outputID }),
               let item = catalog.first(where: { $0.id == sourceID }) else { return }
         SuiteUndo.record("Connect", board: board, audio: audio, apps: item.kind == .app ? [item.key] : [], inputs: item.kind == .input ? [item.key] : []) {
             if item.kind == .app {

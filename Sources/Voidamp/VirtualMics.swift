@@ -75,6 +75,8 @@ final class VirtualMics: ObservableObject {
         // Wires into the virtual mics go too, once they're gone; otherwise an app sent only to a call would fall back
         // to the speakers.
         for index in 1...2 { VoidampRuntime.shared.audio.clearWiring(output: Self.uidPrefix + String(index)) }
+        // Undoing an earlier board change mustn't bring back wires into mics that are gone.
+        SuiteWindowController.shared.undoManager.removeAllActions()
     }
 
     /// Runs a shell command as administrator through macOS's own password prompt. False when it failed or the
