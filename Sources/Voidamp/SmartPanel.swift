@@ -42,7 +42,6 @@ struct SmartPanel: View {
                     // as in the full panel.
                     if !playing.isEmpty {
                         Divider()
-                        sectionLabel("Apps")
                         ForEach(playing) { app in appRow(app) }
                         if !audio.mixingEnabled {
                             Button("Turn On App Volumes") { audio.enableMixing() }
@@ -69,7 +68,8 @@ struct SmartPanel: View {
         Text(title).font(MixerStyle.section).foregroundStyle(.secondary)
     }
 
-    /// The app's icon, its name and a small level slider. Clicking the icon mutes the app.
+    /// The app's icon, its name and a small level slider. Clicking the icon mutes the app; clicking the name returns
+    /// it to 100%.
     private func appRow(_ app: AppSource) -> some View {
         let adjustable = audio.canAdjust(app)
         let live = audio.apps.first { $0.id == app.id } ?? app
@@ -92,7 +92,14 @@ struct SmartPanel: View {
             .disabled(!adjustable)
             .help(live.muted ? "Unmute \(app.name)" : "Mute \(app.name)")
             .accessibilityLabel(live.muted ? "Unmute \(app.name)" : "Mute \(app.name)")
-            Text(app.name).lineLimit(1).frame(width: 92, alignment: .leading).help(app.name)
+            // With no percentage to click, the name returns the app to 100%.
+            Button { audio.setAppGain(app, 1) } label: {
+                Text(app.name).lineLimit(1).frame(width: 92, alignment: .leading).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!adjustable)
+            .help(abs(live.gain - 1) < 0.005 ? "\(app.name) plays at 100%" : "Reset \(app.name) to 100%")
+            .accessibilityLabel("Reset \(app.name) to 100 percent")
             SoundLevelSlider(value: Binding(get: { live.gain }, set: { audio.setAppGain(app, $0, snapping: draggingApps.contains(app.id)) }),
                              muted: live.muted, height: 16, maximum: 2, showsSymbol: false, label: "\(app.name) volume, up to 200 percent") { editing in
                 if editing { draggingApps.insert(app.id) } else { draggingApps.remove(app.id) }
