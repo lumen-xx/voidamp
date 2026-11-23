@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VERSION="${VOIDAMP_VERSION:-1.1.38}"
-BUILD="${VOIDAMP_BUILD:-40}"
+VERSION="${VOIDAMP_VERSION:-1.1.39}"
+BUILD="${VOIDAMP_BUILD:-41}"
 APP="$(pwd)/dist/Voidamp.app"
 swift build -c release
 BIN_PATH="$(swift build -c release --show-bin-path)"
