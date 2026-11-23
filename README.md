@@ -27,6 +27,7 @@ open "/Applications/Voidamp.app"
 - Control each playing app’s volume from **0–200%**, with a snap at **100%**. Click an app’s percentage to return it to 100%.
 - Show or hide one **System Sounds** row for alerts and notifications with **Show System Sounds** in Settings.
 - Mute sound or microphones from the top bar.
+- **Smart mode:** right-click the menu bar icon (or use More) and choose **Smart Mode** for a panel laid out like Control Centre’s Sound: the output level, a slim slider for each app that is playing right now, and your outputs. Microphones aren’t shown because the microphone follows the output: a headset brings its own microphone, and the Mac’s speakers bring the Mac’s. Leaving a headset for speakers without a microphone switches to the Mac’s microphone, while a standalone microphone stays. Click an app’s icon to mute it. Turning Smart mode on turns app mixing on.
 - Choose an output or input device and adjust its volume or microphone gain.
 - Right-click a device to give it a custom name in Voidamp.
 - Save your device selections, levels, mute states and which outputs each app is wired to as **profiles** from **More → Profiles**. Microphone wires aren't part of a profile.
@@ -103,7 +104,7 @@ swift build
 
 The read-only audio self-check also uses an isolated preferences domain to verify profile persistence/deletion, stable device ordering, gain bounds, the 100% snap behavior, undo and redo on the Suite's board with its wiring, and which volume and brightness keys Voidamp takes.
 
-The README images come from sample data in development builds, never from this Mac's apps or devices: `.build/debug/Voidamp --suite-preview --demo` and `--panel-preview --demo` print a window number for `screencapture -l`, `--overlay-snapshot <png> --clear` renders the volume cards, and `swift scripts/marketing.swift <out.png> <headline> <subtitle> <icon.png> <image.png>...` puts them on the background. `docs/demo.mp4`, the 7-second clip for announcements, is recorded with `--suite-preview --demo --demo-play` and `swift scripts/demo-video.swift <pid> <window number> 7 <out.mp4> <headline> <subtitle> <icon.png> <patch.png>`; it captures only that window. App playback routing requires separate live verification with system audio permission.
+The README images come from sample data in development builds, never from this Mac's apps or devices: `.build/debug/Voidamp --suite-preview --demo` and `--panel-preview --demo` print a window number for `screencapture -l` (add `--smart` for Smart mode's panel, or `--popover` to show the panel in a real popover over the desktop, which prints its frame for `screencapture -R`), `--overlay-snapshot <png> --clear` renders the volume cards, and `swift scripts/marketing.swift <out.png> <headline> <subtitle> <icon.png> <image.png>...` puts them on the background. `docs/demo.mp4`, the 7-second clip for announcements, is recorded with `--suite-preview --demo --demo-play` and `swift scripts/demo-video.swift <pid> <window number> 7 <out.mp4> <headline> <subtitle> <icon.png> <patch.png>`; it captures only that window. App playback routing requires separate live verification with system audio permission.
 
 Open `Package.swift` in Xcode to edit. Uses Sparkle for signed app updates. See [updates/README.md](updates/README.md) for release preparation, signing, and publishing.
 

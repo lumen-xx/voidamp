@@ -22,3 +22,9 @@ Each device is a rounded row with a device icon and name; tapping it selects the
 The output level above Apps follows Control Centre’s Sound slider: a 24 pt capsule track, a white fill with the speaker symbol at its start, and a round white knob. Clicking the track jumps to that level.
 
 Each app row ends with its percentage, which resets the app to 100% when clicked. An app Voidamp couldn’t mix shows an orange warning in place of the percentage; clicking it retries. When no app audio can be captured at all, an orange notice under Apps offers Open Settings and Retry instead of an alert.
+
+In the menu bar popover, the popover's own Liquid Glass is the panel's surface; the panel adds no second glass, which frosted it grey. The menu bar icon uses 14 pt symbols, the size of Control Centre's Sound icon.
+
+## Smart mode
+
+Smart mode follows Control Centre's Sound module. A bold 13 pt “Sound” title sits above the output level. When a microphone is muted, a “Mic Muted” capsule beside the title unmutes it; otherwise the header has nothing else. Apps lists only apps playing right now, each with its icon, name and a 16 pt version of the output level with no symbol or percentage; the section is hidden when nothing plays. Clicking an app's icon mutes it, and a muted app's slider dims. Output lists outputs only: a 26 pt circle with the device symbol, filled with the accent color and a white symbol for the active output, then the name. Rows highlight under the pointer like menu items. There is no Mic, Mixing, Suite or Devices control, and no footer. Moving the level unmutes sound.

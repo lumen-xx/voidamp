@@ -39,6 +39,14 @@ final class AudioController: ObservableObject {
     @Published var showSystemSounds: Bool {
         didSet { preferences.set(showSystemSounds, forKey: "showSystemSounds"); refreshApps() }
     }
+    /// Smart mode: the panel shows only the output level, apps and outputs, like Control Centre's Sound, and the
+    /// microphone follows the output. Switched with setSmartMode(_:).
+    @Published var smartMode: Bool {
+        didSet { if smartMode != oldValue { preferences.set(smartMode, forKey: "smartMode") } }
+    }
+    /// The default output at the last refresh, to notice when it changes.
+    private var lastDefaultOutput: String?
+    private var outputNoted = false
     private var routes: [RouteKey: AppRoute] = [:]
     /// Inputs played on outputs, keyed by input and output UID.
     private var monitors: [RouteKey: MonitorRoute] = [:]
@@ -116,6 +124,7 @@ final class AudioController: ObservableObject {
         self.deviceNames = preferences.dictionary(forKey: "deviceNames") as? [String: String] ?? [:]
         self.mixingEnabled = autoStartMixing
         self.showSystemSounds = preferences.object(forKey: "showSystemSounds") as? Bool ?? true
+        self.smartMode = preferences.bool(forKey: "smartMode")
         self.suiteEnabled = preferences.object(forKey: "suiteEnabled") as? Bool ?? true
         self.patchbayMode = preferences.object(forKey: "patchbayMode") as? Bool ?? false
         if let data = preferences.data(forKey: "profiles"), let stored = try? JSONDecoder().decode([MixerProfile].self, from: data) { profiles = stored }
@@ -220,6 +229,15 @@ final class AudioController: ObservableObject {
         restorePendingVolumes()
         refreshApps()
         updateMonitors()
+        // Whoever changed the output (Voidamp, Control Centre, a headset connecting), the microphone follows it.
+        // The first refresh only notes the output.
+        let output = sources.first { !$0.input && $0.isDefault }?.uid
+        if !outputNoted || output != lastDefaultOutput {
+            let changed = outputNoted
+            outputNoted = true
+            lastDefaultOutput = output
+            if smartMode, changed { followOutputWithMicrophone() }
+        }
     }
 
     /// Refreshes as soon as the default devices or the device list change, instead of waiting for the next
@@ -331,6 +349,66 @@ final class AudioController: ObservableObject {
         let status = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &property, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &value)
         if status != noErr { error = "Couldn’t switch to \(source.name) (\(status))." }
         refresh()
+    }
+}
+
+// MARK: Smart mode
+//
+// The microphone follows the output: a headset's own microphone with the headset, the Mac's microphone with its
+// speakers. Only a change of output moves it, so a microphone picked by hand stays until the output changes.
+
+extension AudioController {
+    /// Turns Smart mode on or off. On, mixing starts, since its app sliders need it, and the microphone moves to
+    /// the current output's own.
+    func setSmartMode(_ on: Bool) {
+        smartMode = on
+        guard on else { return }
+        if !mixingEnabled { enableMixing() }
+        followOutputWithMicrophone()
+    }
+
+    /// The microphone that belongs with an output: the same device (a headset), one macOS reports as part of the
+    /// same hardware, the Mac's own microphone for its own speakers, or one named like it ("Studio Display
+    /// Speakers" and "Studio Display Microphone"). Virtual mics are never chosen.
+    func microphone(for output: AudioSource) -> AudioSource? {
+        let mics = sources.filter { $0.input && !$0.isVirtualMic }
+        if let same = mics.first(where: { $0.uid == output.uid }) { return same }
+        let related = Set(HAL.ids(output.device, kAudioDevicePropertyRelatedDevices)).subtracting([output.device])
+        if let mic = mics.first(where: { related.contains($0.device) }) { return mic }
+        if output.isBuiltIn { return mics.first(where: \.isBuiltIn) }
+        guard let stem = Self.nameStem(output.name) else { return nil }
+        return mics.first { Self.nameStem($0.name) == stem }
+    }
+
+    /// The microphone to switch to for an output, or nil to keep the current one. An output without a microphone
+    /// of its own keeps a standalone microphone, but leaving a headset falls back to the Mac's own microphone:
+    /// the headset's would hear nothing once it is off.
+    func microphoneToFollow(_ output: AudioSource) -> AudioSource? {
+        let current = sources.first { $0.input && $0.isDefault }
+        var target = microphone(for: output)
+        if target == nil, let current, !current.isVirtualMic,
+           sources.contains(where: { !$0.input && !$0.isVirtualMic && $0.uid != output.uid && microphone(for: $0)?.uid == current.uid }) {
+            target = sources.first { $0.input && $0.isBuiltIn }
+        }
+        guard let target, target.uid != current?.uid else { return nil }
+        return target
+    }
+
+    func followOutputWithMicrophone() {
+        guard let output = sources.first(where: { !$0.input && $0.isDefault }), let mic = microphoneToFollow(output) else { return }
+        var property = global(kAudioHardwarePropertyDefaultInputDevice)
+        var value = mic.device
+        // Not select(): that refreshes, and this runs inside a refresh. The default-input listener refreshes instead.
+        let status = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &property, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &value)
+        if status == noErr { scheduleRefresh() }
+    }
+
+    /// A device name without the words that say which side of it this is; nil when nothing else is left.
+    static func nameStem(_ name: String) -> String? {
+        let sides: Set<String> = ["speaker", "speakers", "headphones", "output", "microphone", "mic", "input"]
+        var words = name.lowercased().split(whereSeparator: \.isWhitespace).map(String.init)
+        while let last = words.last, sides.contains(last) { words.removeLast() }
+        return words.isEmpty ? nil : words.joined(separator: " ")
     }
 }
 
@@ -942,14 +1020,7 @@ extension AudioController {
     var statusSymbol: String {
         guard let source = activeOutput else { return "speaker.slash.fill" }
         if outputIsMuted { return "speaker.slash.fill" }
-        let name = source.name.lowercased()
-        let port = scalar(source.device, address(kAudioDevicePropertyDataSource), initial: UInt32(0))
-        let headphoneTerminal = HAL.ids(source.device, kAudioDevicePropertyStreams, scope: kAudioDevicePropertyScopeOutput).contains { stream in
-            HAL.read(stream, kAudioStreamPropertyTerminalType, initial: UInt32(0)) == kAudioStreamTerminalTypeHeadphones
-        }
-        if headphoneTerminal || port == 0x6864706e || ["headphone", "headset", "airpod", "earbud", "nothing ear", "evolve2", "arctis"].contains(where: name.contains) {
-            return "headphones"
-        }
+        if isHeadphones(source) { return "headphones" }
         if source.volume < 0.34 { return "speaker.wave.1.fill" }
         if source.volume < 0.67 { return "speaker.wave.2.fill" }
         return "speaker.wave.3.fill"
@@ -957,6 +1028,30 @@ extension AudioController {
     var statusDescription: String {
         guard let source = activeOutput else { return "No output device" }
         return "\(displayName(source)) · \(outputIsMuted ? "Muted" : "\(Int((source.volume * 100).rounded()))%")"
+    }
+
+    /// An output that plays on headphones: by its output terminal, the built-in jack's data source, or its name.
+    func isHeadphones(_ source: AudioSource) -> Bool {
+        guard !source.input else { return false }
+        let name = source.name.lowercased()
+        let port = scalar(source.device, address(kAudioDevicePropertyDataSource), initial: UInt32(0))
+        let headphoneTerminal = HAL.ids(source.device, kAudioDevicePropertyStreams, scope: kAudioDevicePropertyScopeOutput).contains { stream in
+            HAL.read(stream, kAudioStreamPropertyTerminalType, initial: UInt32(0)) == kAudioStreamTerminalTypeHeadphones
+        }
+        return headphoneTerminal || port == 0x6864706e || ["headphone", "headset", "airpod", "earbud", "nothing ear", "evolve2", "arctis"].contains(where: name.contains)
+    }
+
+    /// The symbol for a device in the panel.
+    func deviceSymbol(_ source: AudioSource) -> String {
+        if source.isVirtualMic { return "waveform.and.mic" }
+        let name = source.name.lowercased()
+        if name.contains("airpods") { return source.input ? "mic" : "airpods" }
+        if isHeadphones(source) || ["headphone", "headset", "beats"].contains(where: name.contains) { return source.input ? "mic" : "headphones" }
+        if name.contains("display") || name.contains("hdmi") || name.contains("monitor") || name.contains("tv") { return "display" }
+        if name.contains("macbook") || name.contains("built-in") || name.contains("internal") { return source.input ? "mic" : "laptopcomputer" }
+        if name.contains("bluetooth") { return source.input ? "mic" : "hifispeaker" }
+        if name.contains("usb") || name.contains("interface") { return source.input ? "mic" : "cable.connector" }
+        return source.input ? "mic" : "speaker.wave.2"
     }
 }
 

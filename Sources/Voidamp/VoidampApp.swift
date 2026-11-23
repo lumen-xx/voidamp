@@ -31,6 +31,10 @@ final class VoidampRuntime: ObservableObject {
     /// in the Suite; this keeps what is reached for quickly.
     func moreMenu() -> NSMenu {
         let menu = NSMenu()
+        let smart = ClosureMenuItem("Smart Mode", checked: audio.smartMode) { [audio] in audio.setSmartMode(!audio.smartMode) }
+        smart.toolTip = "A simple panel like Control Centre’s Sound, with app volumes. The microphone follows the output."
+        menu.addItem(smart)
+        menu.addItem(.separator())
         menu.addItem(ClosureMenuItem("Open Voidamp Suite…") { [weak self] in self?.openSuite() })
         menu.addItem(ClosureMenuItem("Settings…") { [weak self] in self?.openSettings() })
         let profiles = NSMenuItem(title: "Profiles", action: nil, keyEquivalent: "")
@@ -175,7 +179,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             // data is already stopped, and stopping again would turn its mixing off.
             if !Demo.isOn { audio.shutDown() }
             if CommandLine.arguments.contains("--muted") { audio.soundMuted = true; audio.micMuted = true }
+            // `--smart` shows Smart mode's panel. Set directly: setSmartMode(_:) would move this Mac's microphone.
+            if CommandLine.arguments.contains("--smart") { audio.smartMode = true }
             let runtime = VoidampRuntime.shared
+            // `--popover` shows the panel in a real popover under a small window, for its glass over the desktop, and
+            // prints the popover's screen frame for `screencapture -R` (y from the top).
+            if CommandLine.arguments.contains("--popover") {
+                let anchor = PreviewPanel(contentRect: NSRect(x: 200, y: 900, width: 60, height: 8), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+                anchor.isOpaque = false; anchor.backgroundColor = .clear; anchor.level = .floating
+                anchor.appearance = NSAppearance(named: CommandLine.arguments.contains("--light") ? .aqua : .darkAqua)
+                anchor.orderFrontRegardless()
+                popover.contentViewController = NSHostingController(rootView: MixerView(audio: audio, updater: runtime.updater, loginItem: runtime.loginItem, inPopover: true))
+                popover.behavior = .applicationDefined
+                popover.animates = false
+                popover.show(relativeTo: anchor.contentView!.bounds, of: anchor.contentView!, preferredEdge: .minY)
+                previewWindow = anchor
+                if let frame = popover.contentViewController?.view.window?.frame, let screen = NSScreen.screens.first {
+                    print("popover \(Int(frame.minX)),\(Int(screen.frame.height - frame.maxY)),\(Int(frame.width)),\(Int(frame.height))"); fflush(stdout)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 6) { exit(0) }
+                return
+            }
             let host = NSHostingView(rootView: MixerView(audio: audio, updater: runtime.updater, loginItem: runtime.loginItem).padding(20))
             host.frame.size = host.fittingSize
             let window = PreviewPanel(contentRect: host.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -237,7 +261,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func configureStatusItem() {
         let runtime = VoidampRuntime.shared
-        let host = FirstClickHostingController(rootView: MixerView(audio: runtime.audio, updater: runtime.updater, loginItem: runtime.loginItem))
+        let host = FirstClickHostingController(rootView: MixerView(audio: runtime.audio, updater: runtime.updater, loginItem: runtime.loginItem, inPopover: true))
         host.sizingOptions = [.preferredContentSize]
         popover.contentViewController = host
         // Closing is ours: a transient popover closes on the status item's mouse-down, and the button's
@@ -288,14 +312,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private static let statusSymbols = ["speaker.slash.fill", "speaker.fill", "speaker.wave.1.fill", "speaker.wave.2.fill", "speaker.wave.3.fill", "headphones"]
+    /// Control Centre draws its Sound icon at 14 pt, a size above the default symbol; the same size matches it.
+    private static func statusGlyph(_ symbol: String) -> NSImage? {
+        NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
+    }
     /// Every icon state is drawn on one canvas the size of the largest symbol. The symbols differ in size, and when
     /// the status item's image changed size macOS re-anchored the open panel, moving it 4 pt whenever sound was muted.
     private static let iconCanvas: NSSize = statusSymbols
-        .compactMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil)?.size }
+        .compactMap { statusGlyph($0)?.size }
         .reduce(NSSize.zero) { NSSize(width: max($0.width, ceil($1.width)), height: max($0.height, ceil($1.height))) }
 
     private static func statusIcon(_ symbol: String) -> NSImage? {
-        guard let glyph = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) else { return nil }
+        guard let glyph = statusGlyph(symbol) else { return nil }
         let canvas = iconCanvas
         let image = NSImage(size: canvas, flipped: false) { _ in
             // Whole-point origins keep the glyph crisp.
@@ -559,7 +587,37 @@ struct VoidampApp: App {
             precondition(!MediaKeyTap.takes(NX_KEYTYPE_SOUND_DOWN, option: false, shift: false, volumeAdjustable: false) { true })
             precondition(MediaKeyTap.takes(NX_KEYTYPE_BRIGHTNESS_UP, option: false, shift: false, volumeAdjustable: false) { true })
             precondition(!MediaKeyTap.takes(NX_KEYTYPE_BRIGHTNESS_DOWN, option: false, shift: false, volumeAdjustable: true) { false })
-            print("PASS: stable device order, profile persistence/deletion, 100% snapping, gain bounds, System Sounds setting, delay line, profile names, Suite undo, media keys")
+            // Smart mode: the microphone follows the output. Sample devices in a stopped controller, so nothing is switched.
+            precondition(AudioController.nameStem("Studio Display Speakers") == "studio display" && AudioController.nameStem("Studio Display Microphone") == "studio display")
+            precondition(AudioController.nameStem("Speakers") == nil)
+            let pairing = AudioController(preferences: preferences, autoStartMixing: false)
+            pairing.shutDown()
+            func sample(_ id: UInt32, _ uid: String, _ name: String, input: Bool, builtIn: Bool = false) -> AudioSource {
+                AudioSource(device: id, uid: uid, name: name, input: input, channels: [0], volume: 0.5, isDefault: false, isBuiltIn: builtIn)
+            }
+            let speakers = sample(9101, "check.speakers", "MacBook Air Speakers", input: false, builtIn: true)
+            let builtInMic = sample(9102, "check.mic", "MacBook Air Microphone", input: true, builtIn: true)
+            let headset = sample(9103, "check.headset", "Jabra Evolve2 75", input: false)
+            let headsetMic = sample(9103, "check.headset", "Jabra Evolve2 75", input: true)
+            let display = sample(9104, "check.display", "Studio Display Speakers", input: false)
+            let displayMic = sample(9105, "check.display.mic", "Studio Display Microphone", input: true)
+            let plainSpeakers = sample(9106, "check.edifier", "Edifier R1280DB", input: false)
+            let standalone = sample(9107, "check.shure", "Shure MV7", input: true)
+            func using(_ output: AudioSource, _ mic: AudioSource) -> AudioSource {
+                pairing.sources = [speakers, builtInMic, headset, headsetMic, display, displayMic, plainSpeakers, standalone].map { (original: AudioSource) -> AudioSource in
+                    var source = original
+                    source.isDefault = source.id == output.id || source.id == mic.id
+                    return source
+                }
+                return pairing.sources.first { $0.id == output.id }!
+            }
+            precondition(pairing.microphoneToFollow(using(headset, builtInMic))?.id == headsetMic.id, "a headset brings its microphone")
+            precondition(pairing.microphoneToFollow(using(speakers, headsetMic))?.id == builtInMic.id, "the Mac's speakers bring its microphone")
+            precondition(pairing.microphoneToFollow(using(display, builtInMic))?.id == displayMic.id, "a display's microphone by name")
+            precondition(pairing.microphoneToFollow(using(plainSpeakers, headsetMic))?.id == builtInMic.id, "leaving a headset for speakers without a microphone")
+            precondition(pairing.microphoneToFollow(using(plainSpeakers, standalone)) == nil, "a standalone microphone stays")
+            precondition(pairing.microphoneToFollow(using(headset, headsetMic)) == nil, "already following")
+            print("PASS: stable device order, profile persistence/deletion, 100% snapping, gain bounds, System Sounds setting, delay line, profile names, Suite undo, media keys, Smart mode microphone")
             for source in controller.sources { print("\(source.input ? "Input" : "Output"): \(source.name) · \(source.channels.count) volume controls") }
             for app in controller.apps { print("App: \(app.name)") }
             controller.shutDown(); reloaded.shutDown(); deleted.shutDown()
@@ -583,14 +641,46 @@ struct MixerView: View {
     @ObservedObject var audio: AudioController
     @ObservedObject var updater: AppUpdater
     @ObservedObject var loginItem: LoginItem
+    /// Inside the menu bar popover, whose own glass is the panel's surface.
+    var inPopover = false
     @State private var devicesExpanded = false
     @State private var renamingDevice: AudioSource?
     @State private var deviceName = ""
-    @State private var measuredContentHeight: CGFloat = 1
     @State private var draggingApps: Set<String> = []
     private let accent = Color.accentColor
 
     var body: some View {
+        Group {
+            if audio.smartMode { SmartPanel(audio: audio) } else { fullPanel }
+        }
+        .padding(14)
+        .frame(width: 340)
+        .fixedSize(horizontal: false, vertical: true)
+        .font(MixerStyle.body)
+        .tint(accent)
+        .modifier(NativePanelSurface(inPopover: inPopover))
+        .alert("Rename device", isPresented: Binding(get: { renamingDevice != nil }, set: { if !$0 { renamingDevice = nil } })) {
+            TextField("Device name", text: $deviceName)
+            Button("Cancel", role: .cancel) { renamingDevice = nil }
+            Button("Save") {
+                if let source = renamingDevice { audio.renameDevice(source, to: deviceName) }
+                renamingDevice = nil
+            }
+        } message: {
+            Text(renamingDevice?.isVirtualMic == true
+                 ? "Apps such as Discord show this name too. Leave empty to restore the original name."
+                 : "This name is only used in Voidamp. Leave empty to restore the original name.")
+        }
+        .onReceive(loginItem.$error.compactMap { $0 }) { message in
+            audio.error = message
+            loginItem.error = nil
+        }
+        .alert("Audio control", isPresented: Binding(get: { audio.error != nil }, set: { if !$0 { audio.error = nil } })) {
+            Button("OK") { audio.error = nil }
+        } message: { Text(audio.error ?? "") }
+    }
+
+    private var fullPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
                 muteButton("Sound", icon: audio.soundMuted ? "speaker.slash.fill" : "speaker.wave.2", active: audio.soundMuted) { audio.toggleSoundMute() }
@@ -634,7 +724,7 @@ struct MixerView: View {
             }), muted: audio.soundMuted)
             .disabled(selectedOutput?.channels.isEmpty ?? true)
             .help(selectedOutput.map { "\(audio.displayName($0)) volume" } ?? "No output device")
-            ScrollView {
+            CappedScroll {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack {
                         Text("Apps").font(MixerStyle.section).foregroundStyle(.secondary)
@@ -653,7 +743,7 @@ struct MixerView: View {
                     if !audio.mixingEnabled {
                         Text("Turn on mixing to adjust each app.").font(MixerStyle.caption).foregroundStyle(.secondary)
                     } else if audio.captureBlocked {
-                        captureNotice
+                        CaptureNotice(audio: audio)
                     }
                     Divider()
                     Button { devicesExpanded.toggle() } label: {
@@ -672,43 +762,8 @@ struct MixerView: View {
                         }
                     }
                 }
-                .padding(.vertical, 2)
-                .background(HideNativeScrollbars())
-                .background(GeometryReader { geometry in
-                    Color.clear.preference(key: MixerContentHeight.self, value: geometry.size.height)
-                })
             }
-            // .hidden still lays the content out 17 pt narrower for a scroll bar it never shows; .never gives the full width.
-            .scrollIndicators(.never)
-            .scrollDisabled(measuredContentHeight <= 380)
-            .frame(height: min(380, measuredContentHeight))
-            .onPreferenceChange(MixerContentHeight.self) { measuredContentHeight = ceil($0) }
         }
-        .padding(14)
-        .frame(width: 340)
-        .fixedSize(horizontal: false, vertical: true)
-        .font(MixerStyle.body)
-        .tint(accent)
-        .modifier(NativePanelSurface())
-        .alert("Rename device", isPresented: Binding(get: { renamingDevice != nil }, set: { if !$0 { renamingDevice = nil } })) {
-            TextField("Device name", text: $deviceName)
-            Button("Cancel", role: .cancel) { renamingDevice = nil }
-            Button("Save") {
-                if let source = renamingDevice { audio.renameDevice(source, to: deviceName) }
-                renamingDevice = nil
-            }
-        } message: {
-            Text(renamingDevice?.isVirtualMic == true
-                 ? "Apps such as Discord show this name too. Leave empty to restore the original name."
-                 : "This name is only used in Voidamp. Leave empty to restore the original name.")
-        }
-        .onReceive(loginItem.$error.compactMap { $0 }) { message in
-            audio.error = message
-            loginItem.error = nil
-        }
-        .alert("Audio control", isPresented: Binding(get: { audio.error != nil }, set: { if !$0 { audio.error = nil } })) {
-            Button("OK") { audio.error = nil }
-        } message: { Text(audio.error ?? "") }
     }
 
     private var selectedOutput: AudioSource? {
@@ -812,43 +867,7 @@ struct MixerView: View {
         }
     }
 
-    /// Shown instead of an alert when capturing app audio produced nothing, which nearly always means macOS
-    /// no longer grants Voidamp Screen & System Audio Recording (for example after an update).
-    private var captureNotice: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label {
-                Text("Apps play normally because Voidamp can’t hear them. Turn Voidamp off and on again in Screen & System Audio Recording, then retry.")
-                    .fixedSize(horizontal: false, vertical: true)
-            } icon: {
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-            }
-            .font(MixerStyle.caption)
-            HStack(spacing: 8) {
-                Button("Open Settings") {
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
-                Button("Retry") { audio.retryMixing() }
-            }
-            .controlSize(.small)
-        }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.orange.opacity(0.1)))
-    }
-
-    private func deviceSymbol(_ source: AudioSource) -> String {
-        if source.isVirtualMic { return "waveform.and.mic" }
-        let name = source.name.lowercased()
-        if name.contains("airpods") { return source.input ? "mic" : "airpods" }
-        if name.contains("headphone") || name.contains("headset") || name.contains("beats") { return source.input ? "mic" : "headphones" }
-        if name.contains("display") || name.contains("hdmi") || name.contains("monitor") || name.contains("tv") { return "display" }
-        if name.contains("macbook") || name.contains("built-in") || name.contains("internal") { return source.input ? "mic" : "laptopcomputer" }
-        if name.contains("bluetooth") { return source.input ? "mic" : "hifispeaker" }
-        if name.contains("usb") || name.contains("interface") { return source.input ? "mic" : "cable.connector" }
-        return source.input ? "mic" : "speaker.wave.2"
-    }
+    private func deviceSymbol(_ source: AudioSource) -> String { audio.deviceSymbol(source) }
     private func deviceSection(_ title: String, input: Bool) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(MixerStyle.section).foregroundStyle(.tertiary)
@@ -902,18 +921,22 @@ struct MixerView: View {
     }
 }
 
+/// On macOS 26 and later the popover is Liquid Glass itself; another glass inside it frosted the panel twice, so it
+/// looked grey instead of glass. Outside a popover (the preview window) the panel draws its own.
 private struct NativePanelSurface: ViewModifier {
+    let inPopover: Bool
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
-            content.glassEffect(.regular, in: .rect(cornerRadius: 16))
+            if inPopover { content } else { content.glassEffect(.regular, in: .rect(cornerRadius: 16)) }
         } else {
             content.background(.regularMaterial)
         }
     }
 }
 
-// San Francisco throughout: one body size, one caption size, medium section labels.
-private enum MixerStyle {
+// San Francisco throughout: one body size, one caption size, medium section labels, and Smart mode's bold title.
+enum MixerStyle {
+    static let title = Font.system(size: 13, weight: .bold)
     static let body = Font.system(size: 12)
     static let section = Font.system(size: 12, weight: .medium)
     static let caption = Font.system(size: 11)
@@ -923,6 +946,59 @@ private enum MixerStyle {
 private struct MixerContentHeight: PreferenceKey {
     static let defaultValue: CGFloat = 1
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+/// The panel's lower part: as tall as its content up to `limit`, then scrolling without a visible scroll bar.
+struct CappedScroll<Content: View>: View {
+    var limit: CGFloat = 380
+    @ViewBuilder var content: Content
+    @State private var height: CGFloat = 1
+
+    var body: some View {
+        ScrollView {
+            content
+                .padding(.vertical, 2)
+                .background(HideNativeScrollbars())
+                .background(GeometryReader { geometry in
+                    Color.clear.preference(key: MixerContentHeight.self, value: geometry.size.height)
+                })
+        }
+        // .hidden still lays the content out 17 pt narrower for a scroll bar it never shows; .never gives the full width.
+        .scrollIndicators(.never)
+        .scrollDisabled(height <= limit)
+        .frame(height: min(limit, height))
+        .onPreferenceChange(MixerContentHeight.self) { height = ceil($0) }
+    }
+}
+
+/// Shown instead of an alert when capturing app audio produced nothing, which nearly always means macOS
+/// no longer grants Voidamp Screen & System Audio Recording (for example after an update).
+struct CaptureNotice: View {
+    @ObservedObject var audio: AudioController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label {
+                Text("Apps play normally because Voidamp can’t hear them. Turn Voidamp off and on again in Screen & System Audio Recording, then retry.")
+                    .fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            }
+            .font(MixerStyle.caption)
+            HStack(spacing: 8) {
+                Button("Open Settings") {
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+                Button("Retry") { audio.retryMixing() }
+            }
+            .controlSize(.small)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.orange.opacity(0.1)))
+    }
 }
 
 // Belt and braces next to .scrollIndicators(.never): keeps the AppKit scroller in overlay style with no scrollers,
@@ -956,7 +1032,7 @@ private final class ScrollbarHider: NSView {
     }
 }
 
-private struct ToolbarIslandSurface: ViewModifier {
+struct ToolbarIslandSurface: ViewModifier {
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
             content.glassEffect(.regular, in: .capsule)
@@ -1028,12 +1104,18 @@ final class ClosureMenuItem: NSMenuItem {
 
 /// The output level, drawn like the Sound slider in Control Centre: a thick track, a white fill carrying
 /// the speaker symbol, and a round knob at the end. Click anywhere to jump there, or drag.
-private struct SoundLevelSlider: View {
+/// Smart mode uses smaller copies for apps: no symbol, a range up to 200%, and drags reported for the 100% snap.
+struct SoundLevelSlider: View {
     @Binding var value: Double
     let muted: Bool
+    var height: CGFloat = 24
+    var maximum: Double = 1
+    var showsSymbol = true
+    var label = "Output volume"
+    var onEditingChanged: (Bool) -> Void = { _ in }
     @Environment(\.isEnabled) private var isEnabled
-    private let height: CGFloat = 24
-    private let step = 1.0 / 16
+    @State private var dragging = false
+    private var step: Double { maximum / 16 }
 
     var body: some View {
         GeometryReader { geometry in
@@ -1042,11 +1124,11 @@ private struct SoundLevelSlider: View {
         .frame(height: height)
         .allowsHitTesting(isEnabled)
         .accessibilityElement()
-        .accessibilityLabel("Output volume")
+        .accessibilityLabel(label)
         .accessibilityValue(muted ? "Muted" : "\(Int((value * 100).rounded())) percent")
         .accessibilityAdjustableAction { direction in
             switch direction {
-            case .increment: value = min(1, value + step)
+            case .increment: value = min(maximum, value + step)
             case .decrement: value = max(0, value - step)
             @unknown default: break
             }
@@ -1056,7 +1138,7 @@ private struct SoundLevelSlider: View {
     private var dimmed: Bool { muted || !isEnabled }
 
     private func track(width: CGFloat) -> some View {
-        let level = min(1, max(0, value))
+        let level = min(1, max(0, value / maximum))
         let travel = max(1, width - height)
         let knobCenter = height / 2 + travel * CGFloat(level)
         let knob = height - 2
@@ -1068,14 +1150,20 @@ private struct SoundLevelSlider: View {
                 .shadow(color: Color.black.opacity(0.22), radius: 1.5, y: 0.5)
                 .frame(width: knob, height: knob)
                 .offset(x: knobCenter - knob / 2)
-            Image(systemName: symbol(level))
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(Color.black.opacity(dimmed ? 0.35 : 0.55))
-                .frame(width: height + 4, height: height)
+            if showsSymbol {
+                Image(systemName: symbol(level))
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Color.black.opacity(dimmed ? 0.35 : 0.55))
+                    .frame(width: height + 4, height: height)
+            }
         }
         .contentShape(Capsule())
         .gesture(DragGesture(minimumDistance: 0).onChanged { drag in
-            value = Double(min(1, max(0, (drag.location.x - height / 2) / travel)))
+            if !dragging { dragging = true; onEditingChanged(true) }
+            value = maximum * Double(min(1, max(0, (drag.location.x - height / 2) / travel)))
+        }.onEnded { _ in
+            dragging = false
+            onEditingChanged(false)
         })
     }
 
