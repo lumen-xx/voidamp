@@ -57,7 +57,11 @@ struct SmartPanel: View {
                         ForEach(audio.sources.filter { !$0.input && !$0.isVirtualMic }) { source in outputRow(source) }
                     }
                 }
+                // Room for the output rows' highlight, which reaches past the labels: the scroll view clips at its
+                // edges, which cut the highlight's rounded corners square.
+                .padding(.horizontal, 6)
             }
+            .padding(.horizontal, -6)
         }
     }
 
@@ -135,7 +139,7 @@ struct SmartPanel: View {
             }
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
-            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(hovered == source.id ? Color.primary.opacity(0.08) : .clear))
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(hovered == source.id ? Color.primary.opacity(0.08) : .clear))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
